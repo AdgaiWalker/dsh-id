@@ -109,7 +109,7 @@ Node 插件仍以用户进程权限运行，理论上可自行 `import node:chil
 ## 测试（干净环境一条命令）
 
 ```bash
-cd dsh-id/plugin
+cd dsh-id
 npm run prepare:test-deps   # 链接 DSH 依赖（不联网）
 npm test                    # 只读 + 执行，共 195 项
 ```

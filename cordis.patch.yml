@@ -1,4 +1,4 @@
-# dsh-account-vault bundle patch
+# dsh-id bundle patch
 #
 # 挂载一个只读的账号与凭据「元数据状态」插件行。
 # 定位：本地只读管理/状态 MVP，不是登录执行器，也不是安全隔离产品。
@@ -21,7 +21,7 @@
 # 注意：本包没有 dsh.client 前端，设置卡是否可视化需以 DSH 实机加载为准。
 - insert:
     - id: tool-account-vault
-      name: dsh-account-vault
+      name: dsh-id
       config:
         vaultDir: ""
         accountsFile: ""

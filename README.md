@@ -42,6 +42,25 @@ dsh-id exec github-pat https://api.github.com/user
 
 ## 安装
 
+### 方式一：当 DSH 插件装（推荐）
+
+仓库根目录就是一个 DSH bundle（`package.json` + `cordis.patch.yml`）。在 DSH 里让 Agent 执行：
+
+```text
+plugin_manager install_bundle  github:AdgaiWalker/dsh-id
+```
+
+或手工装进 profile：
+
+```bash
+cd ~/.dsh/profiles/web
+pnpm add github:AdgaiWalker/dsh-id
+```
+
+装好后在「设置 → 插件」里能看到 `dsh-id`。工具能力取决于机器上有没有装下面的 CLI。
+
+### 方式二：只要命令行
+
 需要：Linux / Python 3.10+ / `openssl`。
 
 ```bash
@@ -52,6 +71,15 @@ dsh-id                       # 看状态（首次会提示还没有凭据）
 ```
 
 `install.sh` 只做三件事：拷文件、`chmod 755`、建数据目录。它不启动任何常驻服务。
+
+### 目录结构
+
+```text
+package.json  cordis.patch.yml  lib/   ← DSH bundle 本体
+cli/bin/  cli/lib/                     ← 五个命令行 + 两个 Python 库
+docs/plugin.md                         ← 插件安装与工具清单细则
+install.sh  test.sh                    ← 装 CLI / 冒烟测试
+```
 
 ---
 
@@ -108,15 +136,15 @@ dsh-id guard check "删除生产库" # → require_approval / allow
 
 ---
 
-## DSH 插件（可选）
+## DSH 插件
 
-`plugin/` 是一个 DSH bundle，把上面这些能力包成工具交给模型：
+仓库根目录就是 bundle，把上面这些能力包成工具交给模型：
 
 - 8 个只读工具：账号/凭据/会话**元数据**、审批队列、审计链校验、边界说明
 - 4 个执行工具：带凭据发请求、用会话开浏览器、浏览器操作、关浏览器
 - 全部工具都不返回凭据值；截图只返回文件路径，不返回 base64
 
-安装见 [`plugin/README.md`](plugin/README.md)。它与 CLI 解耦，不装插件也能用命令行。
+细则见 [`docs/plugin.md`](docs/plugin.md)。它与 CLI 解耦，不装插件也能用命令行。
 
 ---
 
@@ -156,7 +184,7 @@ dsh-id guard check "删除生产库" # → require_approval / allow
 ## 兼容性
 
 - Python 3.10+（标准库 + `openssl` 命令行，无第三方依赖）
-- 插件针对 DSH `0.2.2-rc.1` 开发，devDependencies 见 `plugin/package.json`
+- 插件针对 DSH `0.2.2-rc.1` 开发，devDependencies 见根目录 `package.json`
 - 在 Arch Linux / Omarchy 上实测
 
 ---

@@ -11,10 +11,10 @@ mkdir -p "$BIN" "$LIB" "$VAULT"
 chmod 700 "$VAULT"
 
 for f in dsh-id vault-cred vault-session vault-guard vault-exec vault-proxy accounts; do
-  install -m 755 "$SRC/bin/$f" "$BIN/$f"
+  install -m 755 "$SRC/cli/bin/$f" "$BIN/$f"
 done
-install -m 644 "$SRC/lib/vaultlib.py" "$LIB/vaultlib.py"
-install -m 644 "$SRC/lib/guardlib.py" "$LIB/guardlib.py"
+install -m 644 "$SRC/cli/lib/vaultlib.py" "$LIB/vaultlib.py"
+install -m 644 "$SRC/cli/lib/guardlib.py" "$LIB/guardlib.py"
 
 echo "已安装："
 echo "  $BIN/dsh-id 及 vault-* 五个命令"

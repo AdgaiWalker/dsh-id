@@ -1,7 +1,7 @@
 {
-  "name": "dsh-account-vault",
-  "version": "0.3.0",
-  "description": "DSH 插件：账号与凭据元数据只读查询 + 执行能力（带凭据发请求、会话开浏览器、浏览器操作）。不返回凭据值。",
+  "name": "dsh-id",
+  "version": "0.1.0",
+  "description": "DSH bundle：给 AI Agent 的账号执行层——凭据按需注入、登录态复用、不可逆操作闸门、哈希链审计。工具不返回凭据值。",
   "type": "module",
   "main": "lib/index.js",
   "exports": {
@@ -38,5 +38,21 @@
   "engines": {
     "node": ">=20"
   },
-  "license": "MIT"
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/AdgaiWalker/dsh-id.git"
+  },
+  "homepage": "https://github.com/AdgaiWalker/dsh-id",
+  "bugs": {
+    "url": "https://github.com/AdgaiWalker/dsh-id/issues"
+  },
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "credentials",
+    "secrets",
+    "agent",
+    "security"
+  ]
 }
