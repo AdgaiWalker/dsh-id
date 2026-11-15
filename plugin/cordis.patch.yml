@@ -1,0 +1,28 @@
+# dsh-account-vault bundle patch
+#
+# 挂载一个只读的账号与凭据「元数据状态」插件行。
+# 定位：本地只读管理/状态 MVP，不是登录执行器，也不是安全隔离产品。
+#
+# 提供的工具（全部只读，绝不返回秘密）：
+#   account_vault_overview           总览（代理可达性/凭据数/会话数/待审批/审计存在）
+#   account_vault_accounts           账号与平台列表（标识符默认打码，无自由文本）
+#   account_vault_account            单账号查询（有范围，可选 reveal_identifier）
+#   account_vault_credentials        凭据名与元数据（不解密）
+#   account_vault_sessions           会话元数据（不含 cookie）
+#   account_vault_guard_status       审批队列（只读，不能 approve）
+#   account_vault_audit_status       审计哈希链校验（重算每条 hash）
+#   account_vault_security_boundary  安全边界披露
+#
+# 配置可从 dsh 设置（命名空间 `account-vault`）修改：
+#   vaultDir      数据目录，默认 ~/.deepseekbot/vault
+#   accountsFile  账号笔记，默认 ~/.deepseekbot/accounts.yaml
+#   probeUrl      代理探测地址；**留空字符串可完全禁用探测**（避免代理侧审计副作用）
+#
+# 注意：本包没有 dsh.client 前端，设置卡是否可视化需以 DSH 实机加载为准。
+- insert:
+    - id: tool-account-vault
+      name: dsh-account-vault
+      config:
+        vaultDir: ""
+        accountsFile: ""
+        probeUrl: ""

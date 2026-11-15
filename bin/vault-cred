@@ -1,0 +1,686 @@
+#!/usr/bin/env python3
+"""vault-cred — 账号执行层凭据管理
+
+⚠ vault-proxy 常驻服务已停用（stop + disable），勿再启用：
+  它监听 127.0.0.1:48771 且无调用方认证，同用户任意进程可用真实凭据。
+  日常调用请用 `vault-exec run|curl`（按需注入，用完即失效）。
+  本工具的 add/list/rm/status/audit-verify 等管理命令不受影响。
+
+用法
+----
+    vault-cred add <名字> <类型> --domains a.com,b.com [--header-name X-Api-Key] [--param-name api_key]
+    vault-cred list
+    vault-cred rm <名字>
+    vault-cred test <名字> <host> <路径>
+
+类型
+----
+    bearer  → Authorization: Bearer <值>
+    basic   → Authorization: Basic base64(<值>)     # 值写成 user:pass
+    header  → <header-name>: <值>
+    query   → 拼到 URL 查询参数 <param-name>=<值>
+
+安全
+----
+- 凭据值交互输入，不回显（getpass），不落 shell 历史
+- 也可从 stdin 读（管道），便于自动化；但绝不从 argv 读
+- 元数据（名字/类型/domains）明文存，供代理在解密前校验白名单
+"""
+
+import argparse
+import json
+import os
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+
+sys.path.insert(0, os.path.expanduser("~/.local/lib"))
+import vaultlib as V  # noqa: E402
+
+PROXY = "http://127.0.0.1:48771"
+
+
+def _read_secret(prompt):
+    """优先 getpass（不回显）；非 TTY 则读 stdin。"""
+    if sys.stdin.isatty():
+        import getpass
+        return getpass.getpass(prompt)
+    return sys.stdin.read().strip()
+
+
+def cmd_add(args):
+    name = args.name
+    ctype = args.type
+
+    if not V.CREDNAME_RE.match(name):
+        sys.exit("凭据名只能用字母数字 . _ -，长度 1-64")
+    if ctype not in V.SUPPORTED_TYPES:
+        sys.exit("类型必须是: " + ", ".join(V.SUPPORTED_TYPES))
+
+    domains = [d.strip().lower() for d in (args.domains or "").split(",") if d.strip()]
+    if not domains:
+        sys.exit("必须给 --domains（默认拒绝，白名单不能为空）")
+
+    meta = {
+        "name": name,
+        "type": ctype,
+        "domains": domains,
+        "created_at": int(__import__("time").time()),
+    }
+    if ctype == "header":
+        if not args.header_name:
+            sys.exit("header 类型必须给 --header-name")
+        meta["header_name"] = args.header_name
+    if ctype == "query":
+        if not args.param_name:
+            sys.exit("query 类型必须给 --param-name")
+        meta["param_name"] = args.param_name
+
+    if V.meta_exists(name) and not args.force:
+        sys.exit(f"凭据 {name} 已存在；要覆盖请加 --force")
+
+    hint = "输入凭据值（不回显）: " if ctype != "basic" else "输入 user:pass（不回显）: "
+    value = _read_secret(hint)
+    if not value:
+        sys.exit("凭据值为空，未保存")
+
+    V.save_secret(name, value)
+    V.save_meta(meta)
+    value = None  # 丢弃
+
+    print(f"✓ 已保存凭据 {name}")
+    print(f"  类型: {ctype}")
+    print(f"  域名白名单: {', '.join(domains)}")
+    if ctype == "header":
+        print(f"  注入头: {meta['header_name']}")
+    if ctype == "query":
+        print(f"  查询参数: {meta['param_name']}")
+    print(f"  用法（推荐，按需注入）: vault-exec curl {name} https://<host>/<path>")
+    print(f"  用法（常驻代理，需先自行启动 vault-proxy）: curl {PROXY}/{name}/<host>/<path>")
+
+
+def cmd_list(args):
+    creds = V.list_credentials()
+    if not creds:
+        print("（无凭据）")
+        return
+    print(f"{'名字':<22}{'类型':<10}{'域名白名单'}")
+    print("-" * 68)
+    for c in creds:
+        domains = ", ".join(c.get("domains") or []) or "（空 · 全部拒绝）"
+        print(f"{c.get('name', '?'):<22}{c.get('type', '?'):<10}{domains}")
+
+
+def cmd_rm(args):
+    removed = V.remove_credential(args.name)
+    if removed:
+        print(f"✓ 已删除凭据 {args.name}（{len(removed)} 个文件）")
+    else:
+        print(f"凭据 {args.name} 不存在")
+
+
+def cmd_panic(args):
+    res = V.panic(dry_run=args.dry_run)
+
+    if args.dry_run:
+        print("=== panic --dry-run（未做任何改动）===")
+        print(f"会停止服务:   {V.SERVICE}")
+        print(f"会禁用服务:   {V.SERVICE}（重启机器也不会自愈）")
+        print(f"会隔离密文:   {len(res['secrets'])} 个")
+        for s in res["secrets"]:
+            print(f"  - {s}")
+        print(f"隔离目录:     {res['quarantine_dir']}")
+        print()
+        print("注意：vault.key 与元数据不会被删除，随时可恢复。")
+        print("确认执行请运行: vault-cred panic")
+        return
+
+    print("=== PANIC 已执行 ===")
+    if res["service_stopped"]:
+        print("✓ 代理服务已停止（AI 立刻失去登录能力）")
+    else:
+        print(f"⚠ 服务停止失败: {res.get('service_error', '未知原因')}")
+        print(f"  请手动确认: systemctl --user status {V.SERVICE}")
+
+    if res.get("service_disabled"):
+        print("✓ 服务已禁用（重启机器也不会自愈，必须人工恢复）")
+    else:
+        print(f"⚠ 服务禁用失败: {res.get('disable_error', '未知原因')}")
+
+    print(f"✓ 已隔离 {len(res['moved'])} 个凭据密文 → {res['quarantine_dir']}")
+    for m in res["moved"]:
+        print(f"  - {m}")
+    if res["failed"]:
+        print(f"⚠ {len(res['failed'])} 个文件挪动失败:")
+        for p, err in res["failed"]:
+            print(f"  - {os.path.basename(p)}: {err}")
+
+    print()
+    print("恢复方法: vault-cred restore")
+    print("（会自动挪回密文、重新启用并启动服务、验证一次调用）")
+    print()
+    print("vault.key 未被动过，密文仍可解密，恢复后立即可用。")
+
+
+def cmd_restore(args):
+    if args.list:
+        dirs = V.list_quarantines()
+        if not dirs:
+            print("（没有可恢复的隔离目录）")
+            return
+        print(f"可恢复的隔离目录（共 {len(dirs)} 个，最新的在前）:")
+        print(f"{'时间戳':<20}{'凭据数':<8}{'凭据'}")
+        print("-" * 68)
+        for d in dirs:
+            names = ", ".join(f[:-len(".secret.enc")] for f in d["files"]) or "（空）"
+            print(f"{d['stamp']:<20}{d['count']:<8}{names}")
+        print()
+        print("恢复最新:   vault-cred restore")
+        print("恢复指定:   vault-cred restore <时间戳>")
+        return
+
+    res = V.restore(stamp=args.stamp)
+
+    if res["error"] and not res["restored"]:
+        sys.exit("✗ " + res["error"])
+
+    print("=== RESTORE ===")
+    print(f"隔离目录: {res['quarantine_dir']}")
+    print(f"✓ 已挪回 {len(res['restored'])} 个凭据密文")
+    for fn in res["restored"]:
+        print(f"  - {fn}")
+    if res["failed"]:
+        print(f"⚠ {len(res['failed'])} 个文件恢复失败:")
+        for fn, err in res["failed"]:
+            print(f"  - {fn}: {err}")
+
+    # 隔离目录清理结果
+    if res.get("dir_removed"):
+        print("✓ 隔离目录已空，已自动删除")
+    elif res.get("dir_kept"):
+        left = res.get("dir_leftovers") or []
+        print(f"⚠ 隔离目录未删（仍有 {len(left)} 项）: {', '.join(left) or '未知'}")
+
+    if res["service_enabled"]:
+        print(f"✓ 服务已 enable --now: {V.SERVICE}")
+    else:
+        print(f"⚠ 服务启动失败: {res.get('error', '未知原因')}")
+
+    state = "active" if res["service_active"] else "inactive"
+    print(f"  当前状态: {state}")
+
+    # 探针只是加分项：服务起来了就不算失败
+    if res["verify_code"]:
+        code = res["verify_code"]
+        target = f"{res.get('verify_host', '')}{res.get('verify_path', '')}"
+        if 200 <= code < 400:
+            print(f"✓ 探针通过: {res['verify_cred']} → GET {target} = HTTP {code}")
+        else:
+            print(f"  服务已启动，探针未通过（不影响使用）: "
+                  f"{res['verify_cred']} → GET {target} = HTTP {code}")
+    else:
+        print("  （没有可探测的凭据，跳过探针）")
+
+    if not res["ok"]:
+        sys.exit(1)
+
+
+def _guard_batch(action_desc):
+    """批量高危操作的审批闸门。
+
+    设计取舍：
+      - 单个 rm / revoke 不拦（太频繁，会烦死老板）
+      - **批量**（--all、多个名字）才拦
+      - panic 不拦：它是救命命令，延误时机比误操作更危险
+    返回 True 表示已批准可继续；否则打印原因并退出。
+    """
+    try:
+        sys.path.insert(0, os.path.expanduser("~/.local/lib"))
+        import guardlib as G
+    except Exception:
+        print("⚠ 审批模块不可用，为安全起见拒绝执行批量操作。")
+        sys.exit(1)
+
+    r = G.check(action_desc)
+    if r["decision"] == "allow":
+        return True
+
+    print("⚠ 这是批量高危操作，需要老板批准后才能执行。")
+    print(f"  操作: {action_desc}")
+    print(f"  命中: {', '.join(r['hits'])}")
+    print(f"  待批准 id: {r['id']}")
+    print()
+    print(f"  请老板执行: vault-guard approve {r['id']}")
+    print(f"  批准后重新运行本命令，并加 --approval-id {r['id']}")
+    sys.exit(10)
+
+
+def _check_approval(approval_id):
+    """校验 --approval-id 是否真的被批准过。"""
+    if not approval_id:
+        return False
+    try:
+        sys.path.insert(0, os.path.expanduser("~/.local/lib"))
+        import guardlib as G
+        return G.is_approved(approval_id)
+    except Exception:
+        return False
+
+
+def cmd_revoke(args):
+    # 批量吊销：必须过审批闸门
+    if getattr(args, "all", False) or getattr(args, "names", None):
+        names = list(args.names or [])
+        if args.all:
+            names = [c["name"] for c in V.list_credentials()]
+        if not names:
+            sys.exit("没有可吊销的凭据")
+
+        # 审批条件：显式 --all（无论几个凭据）或多个名字。
+        # 注意：不能只看 len(names) > 1 —— 只有 1 个凭据时 --all 同样是"全部"
+        # 语义，必须拦。（这个 bug 实测踩过：--all 在单凭据时直接执行了）
+        if args.all or len(names) > 1:
+            desc = ("吊销全部凭据（%d 个）: %s" % (len(names), ", ".join(names[:6]))
+                    if args.all else
+                    "批量吊销 %d 个凭据: %s" % (len(names), ", ".join(names[:6])))
+            if not _check_approval(getattr(args, "approval_id", None)):
+                _guard_batch(desc)
+                sys.exit(10)
+            print(f"✓ 审批已通过（id: {args.approval_id}）")
+
+        failed = []
+        for n in names:
+            ok, qdir, moved, err = V.revoke(n)
+            if ok:
+                print(f"✓ 已吊销 {n}（{len(moved)} 个文件）")
+            else:
+                failed.append((n, err))
+                print(f"✗ {n}: {err}")
+        if failed:
+            sys.exit(f"{len(failed)} 个吊销失败")
+        return
+
+    ok, qdir, moved, err = V.revoke(args.name)
+    if not ok:
+        sys.exit("吊销失败: " + (err or "未知原因"))
+    print(f"✓ 已吊销凭据 {args.name}（{len(moved)} 个文件）")
+    print(f"  隔离目录: {qdir}")
+    print("  恢复: 把上面的文件挪回 " + V.PROXY_DIR)
+    print("  注意: 代理仍在运行，该凭据的密文已不在原位，无法再解密注入。")
+
+
+def cmd_audit_verify(args):
+    path = args.file or V.AUDIT_LOG
+    ok, problems, total, legacy = V.verify_chain(path)
+    print(f"审计日志: {path}")
+    print(f"总行数: {total}  旧格式遗留行(无 hash，作为链起点): {legacy}")
+    if ok is None:
+        print("? 无法校验（不是健康，也不是被篡改）:")
+        for _, msg in problems:
+            print(f"  {msg}")
+        sys.exit(1)
+    if ok:
+        print("✓ 哈希链完整，未被篡改")
+        return
+    print(f"✗ 发现 {len(problems)} 处问题:")
+    for lineno, msg in problems:
+        print(f"  第 {lineno} 行: {msg}")
+    sys.exit(1)
+
+
+def _ask_password(prompt="主密码: ", confirm=False):
+    """交互读密码，不回显。非 TTY 时读 stdin（便于自动化测试）。"""
+    import getpass
+    if sys.stdin.isatty():
+        p1 = getpass.getpass(prompt)
+        if confirm:
+            p2 = getpass.getpass("再输一次确认: ")
+            if p1 != p2:
+                sys.exit("两次输入不一致")
+        return p1
+    return sys.stdin.readline().rstrip("\n")
+
+
+def cmd_init(args):
+    if V.master_enabled():
+        sys.exit("主密码已设置过；改密码用 vault-cred passwd")
+    print("=== 设置主密码 ===")
+    print("主密码用于解锁保险库。忘记它只能靠恢复码，请务必记牢。")
+    print("（输入不回显）")
+    pw = _ask_password("设置主密码: ", confirm=True)
+    if len(pw) < 8:
+        sys.exit("主密码至少 8 位")
+    meta = V.init_master(pw, timeout_minutes=args.timeout)
+    pw = None
+    print()
+    print("✓ 主密码已设置")
+    print(f"✓ 明文 vault.key 已删除，磁盘上只留被包裹的 vault.key.enc")
+    print(f"✓ 自动锁定超时: {meta['timeout_minutes']} 分钟")
+    print(f"✓ 当前已解锁")
+    print()
+    print("下一步强烈建议: vault-cred recovery-codes")
+    try:
+        V.audit_event(action="master_init", cred="-", host="-", path="-", status=0,
+                      note="timeout=%s" % meta["timeout_minutes"])
+    except Exception:
+        pass
+
+
+def cmd_unlock(args):
+    if not V.master_enabled():
+        sys.exit("尚未设置主密码，请先 vault-cred init")
+    if not V.is_locked():
+        ok, remain, _, _ = V.unlock_status()
+        print(f"已经解锁（剩余 {remain // 60} 分钟）")
+        return
+    pw = _ask_password("主密码: ")
+    ok = V.unlock(pw, timeout_minutes=args.timeout)
+    pw = None
+    if not ok:
+        try:
+            V.audit_event(action="unlock_failed", cred="-", host="-", path="-", status=401)
+        except Exception:
+            pass
+        sys.exit("✗ 主密码错误")
+    ok2, remain, exp, _ = V.unlock_status()
+    print(f"✓ 已解锁，{remain // 60} 分钟内免密")
+    try:
+        V.audit_event(action="unlock", cred="-", host="-", path="-", status=0,
+                      note="remain=%ds" % remain)
+    except Exception:
+        pass
+
+
+def cmd_lock(args):
+    removed = V.lock()
+    if removed:
+        print("✓ 已锁定（解锁态密钥已从内存盘删除）")
+    else:
+        print("已经是锁定状态")
+    try:
+        V.audit_event(action="lock", cred="-", host="-", path="-", status=0)
+    except Exception:
+        pass
+
+
+def cmd_status(args):
+    """状态总览。机器绑定是默认模式（AI 自理，无需人输密码）。"""
+    machine = V.machine_enabled()
+    master = V.master_enabled()
+
+    # 实际能不能解密（最关键的判断）
+    usable = True
+    usable_src = "-"
+    usable_err = None
+    try:
+        dek, src = V.current_dek()
+        usable_src = src
+    except V.VaultError as e:
+        usable = False
+        usable_err = str(e)
+
+    print("=== 保险库状态 ===")
+    print(f"当前可用:   {'✓ 可以解密（无需密码）' if usable else '✗ 不可用: ' + str(usable_err)}")
+    if usable:
+        label = {"machine": "机器绑定（自动解锁，无需密码）",
+                 "session": "主密码解锁态",
+                 "legacy": "旧版明文 key"}.get(usable_src, usable_src)
+        print(f"解锁方式:   {label}")
+
+    print(f"机器绑定:   {'✓ 已启用' if machine else '✗ 未启用'}")
+    print(f"主密码:     {'✓ 已启用（可选加强项）' if master else '未启用（默认，AI 自理）'}")
+
+    if master:
+        unlocked, remain, exp, timeout = V.unlock_status()
+        if unlocked and remain is not None:
+            print(f"主密码态:   🔓 已解锁，剩余 {remain // 60} 分钟（超时 {timeout} 分钟）")
+        else:
+            print(f"主密码态:   🔒 已锁定（不影响机器绑定自动解锁）")
+
+    if V.recovery_available():
+        info = V.recovery_info() or {}
+        print(f"恢复码:     ✓ 已生成（{info.get('count', 0)} 个）")
+    else:
+        print(f"恢复码:     未生成（主密码默认关闭，可不做）")
+
+    print(f"凭据数:     {len(V.list_credentials())}")
+    print(f"会话数:     {len(V.list_sessions())}")
+
+
+def cmd_passwd(args):
+    if not V.master_enabled():
+        sys.exit("尚未设置主密码，请先 vault-cred init")
+    print("=== 修改主密码 ===")
+    old = _ask_password("当前主密码: ")
+    new = _ask_password("新主密码: ", confirm=True)
+    if len(new) < 8:
+        sys.exit("新主密码至少 8 位")
+    ok = V.change_password(old, new)
+    old = new = None
+    if not ok:
+        sys.exit("✗ 当前主密码错误")
+    print("✓ 主密码已修改，已重新解锁")
+    print("  注意：恢复码仍然有效（它们独立包裹同一把密钥）")
+    try:
+        V.audit_event(action="master_passwd", cred="-", host="-", path="-", status=0)
+    except Exception:
+        pass
+
+
+def cmd_timeout(args):
+    if not V.master_enabled():
+        sys.exit("尚未设置主密码")
+    if args.minutes is None:
+        meta = V.load_master_meta()
+        print(f"当前自动锁定超时: {meta['timeout_minutes']} 分钟")
+        print("修改: vault-cred timeout <分钟数>")
+        return
+    if args.minutes < 1:
+        sys.exit("超时至少 1 分钟")
+    meta = V.load_master_meta()
+    meta["timeout_minutes"] = int(args.minutes)
+    V.save_master_meta(meta)
+    print(f"✓ 自动锁定超时已设为 {args.minutes} 分钟")
+    print("  （对下一次 unlock 生效）")
+
+
+def cmd_recovery_codes(args):
+    if not V.master_enabled():
+        sys.exit("请先设置主密码再生成恢复码")
+    if V.is_locked():
+        sys.exit("保险库已锁定，请先 vault-cred unlock")
+    if V.recovery_available() and not args.force:
+        info = V.recovery_info()
+        sys.exit(f"恢复码已存在（{info['count']} 个，生成于 {info['created_at_str']}）。"
+                 f"\n要重新生成请加 --force（旧的会全部作废）")
+
+    codes = V.generate_recovery_codes(args.count)
+    print()
+    print("=" * 58)
+    print("  紧急恢复码（每个只能用一次，请抄下来妥善保存）")
+    print("=" * 58)
+    print()
+    for i, c in enumerate(codes, 1):
+        print(f"  {i:2}.  {c}")
+    print()
+    print("=" * 58)
+    print("  ⚠ 这些码只在屏幕上显示这一次，不会存明文到磁盘。")
+    print("  ⚠ 主密码遗忘时，用任意一个码可重置主密码。")
+    print("  ⚠ 请存到：密码管理器 / 打印后锁进抽屉 / 与主密码分开的地方。")
+    print("=" * 58)
+    print()
+    try:
+        V.audit_event(action="recovery_generate", cred="-", host="-", path="-",
+                      status=0, note="count=%d" % len(codes))
+    except Exception:
+        pass
+
+
+def cmd_recovery_reset(args):
+    if not V.recovery_available():
+        sys.exit("没有可用的恢复码，无法重置")
+    print("=== 用恢复码重置主密码 ===")
+    code = input("恢复码: ").strip() if sys.stdin.isatty() else sys.stdin.readline().strip()
+    new = _ask_password("新主密码: ", confirm=True)
+    if len(new) < 8:
+        sys.exit("新主密码至少 8 位")
+    ok, msg = V.reset_with_recovery_code(code, new)
+    code = new = None
+    if not ok:
+        sys.exit("✗ " + msg)
+    print("✓ " + msg)
+    try:
+        V.audit_event(action="recovery_reset", cred="-", host="-", path="-", status=0)
+    except Exception:
+        pass
+
+
+def cmd_audit_report(args):
+    r = V.audit_report()
+    print("=" * 66)
+    print(f"  保险库安全审计报告")
+    print("=" * 66)
+    print()
+    bar_len = 30
+    filled = int(round(bar_len * r["score"] / 100))
+    bar = "█" * filled + "░" * (bar_len - filled)
+    print(f"  健康分: {r['score']}/100  [{bar}]  {r['grade']}")
+    print()
+    print(f"  凭据 {r['counts']['credentials']} 个 · 会话 {r['counts']['sessions']} 个")
+    print(f"  高风险 {r['counts']['high']} · 中风险 {r['counts']['medium']} · 低风险 {r['counts']['low']}")
+    print(f"  主密码: {'已启用' if r['master_enabled'] else '未启用'}"
+          f" · 恢复码: {'已生成' if r['recovery_available'] else '未生成'}"
+          f" · 自动锁定: {r['timeout_minutes']} 分钟")
+    print()
+    if not r["findings"]:
+        print("  ✓ 没有发现风险项")
+    else:
+        print("  风险清单:")
+        order = {"high": 0, "medium": 1, "low": 2}
+        icon = {"high": "🔴", "medium": "🟡", "low": "🔵"}
+        for sev, cat, name, msg in sorted(r["findings"], key=lambda f: order[f[0]]):
+            print(f"    {icon[sev]} [{cat}] {name}: {msg}")
+    print()
+    print("=" * 66)
+
+
+def cmd_test(args):
+    url = f"{PROXY}/{args.name}/{args.host}/{args.path.lstrip('/')}"
+    req = urllib.request.Request(url, method="GET")
+    print(f"→ GET {url}")
+    try:
+        with urllib.request.urlopen(req, timeout=35) as r:
+            body = r.read()
+            print(f"← HTTP {r.status} {r.reason}")
+            ctype = r.headers.get("Content-Type", "")
+            print(f"  Content-Type: {ctype}")
+            text = body.decode("utf-8", "replace")
+            print("  响应前 400 字符:")
+            print(text[:400])
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", "replace")
+        print(f"← HTTP {e.code} {e.reason}")
+        print("  " + body[:400])
+        sys.exit(1)
+    except urllib.error.URLError as e:
+        sys.exit(f"连不上代理（服务没起？）: {e.reason}")
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        prog="vault-cred", description="账号执行层凭据管理")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    p_add = sub.add_parser("add", help="新增凭据（交互输入值，不回显）")
+    p_add.add_argument("name")
+    p_add.add_argument("type", choices=V.SUPPORTED_TYPES)
+    p_add.add_argument("--domains", required=True,
+                       help="域名白名单，逗号分隔；支持 *.example.com")
+    p_add.add_argument("--header-name", dest="header_name",
+                       help="header 类型要注入的请求头名")
+    p_add.add_argument("--param-name", dest="param_name",
+                       help="query 类型要拼的查询参数名")
+    p_add.add_argument("--force", action="store_true", help="覆盖已存在的凭据")
+    p_add.set_defaults(func=cmd_add)
+
+    p_list = sub.add_parser("list", help="列出凭据（只显示名字/类型/域名）")
+    p_list.set_defaults(func=cmd_list)
+
+    p_rm = sub.add_parser("rm", help="删除凭据")
+    p_rm.add_argument("name")
+    p_rm.set_defaults(func=cmd_rm)
+
+    p_test = sub.add_parser("test", help="走代理测一次")
+    p_test.add_argument("name")
+    p_test.add_argument("host")
+    p_test.add_argument("path")
+    p_test.set_defaults(func=cmd_test)
+
+    p_panic = sub.add_parser("panic", help="一键吊销：停代理 + 禁用服务 + 隔离所有凭据密文")
+    p_panic.add_argument("--dry-run", dest="dry_run", action="store_true",
+                         help="只看会做什么，不真删")
+    p_panic.set_defaults(func=cmd_panic)
+
+    p_restore = sub.add_parser("restore", help="一条命令恢复：挪回密文 + 启用服务 + 验证")
+    p_restore.add_argument("stamp", nargs="?", default=None,
+                           help="指定要恢复的时间戳（默认恢复最新的）")
+    p_restore.add_argument("--list", action="store_true", dest="list",
+                           help="列出所有可恢复的隔离目录")
+    p_restore.set_defaults(func=cmd_restore)
+
+    p_revoke = sub.add_parser("revoke", help="吊销凭据（单个不拦；批量需审批）")
+    p_revoke.add_argument("name", nargs="?", help="要吊销的凭据名")
+    p_revoke.add_argument("names", nargs="*", help="（批量）多个凭据名")
+    p_revoke.add_argument("--all", action="store_true", help="吊销全部凭据（需审批）")
+    p_revoke.add_argument("--approval-id", dest="approval_id",
+                          help="vault-guard 批准后的 id")
+    p_revoke.set_defaults(func=cmd_revoke)
+
+    p_verify = sub.add_parser("audit-verify", help="校验审计日志哈希链完整性")
+    p_verify.add_argument("--file", help="指定审计文件（默认 ~/.deepseekbot/vault/audit.log）")
+    p_verify.set_defaults(func=cmd_audit_verify)
+
+    # ── 主密码 / 自动锁定 ──
+    p_init = sub.add_parser("init", help="设置主密码（首次）")
+    p_init.add_argument("--timeout", type=int, default=None,
+                        help="自动锁定超时分钟数（默认 30）")
+    p_init.set_defaults(func=cmd_init)
+
+    p_unlock = sub.add_parser("unlock", help="解锁保险库")
+    p_unlock.add_argument("--timeout", type=int, default=None,
+                          help="本次解锁有效期（分钟）")
+    p_unlock.set_defaults(func=cmd_unlock)
+
+    p_lock = sub.add_parser("lock", help="立即锁定")
+    p_lock.set_defaults(func=cmd_lock)
+
+    p_status = sub.add_parser("status", help="查看解锁状态与剩余时间")
+    p_status.set_defaults(func=cmd_status)
+
+    p_passwd = sub.add_parser("passwd", help="修改主密码")
+    p_passwd.set_defaults(func=cmd_passwd)
+
+    p_timeout = sub.add_parser("timeout", help="查看/设置自动锁定超时")
+    p_timeout.add_argument("minutes", nargs="?", type=int, default=None)
+    p_timeout.set_defaults(func=cmd_timeout)
+
+    # ── 恢复码 ──
+    p_rc = sub.add_parser("recovery-codes", help="生成紧急恢复码")
+    p_rc.add_argument("--count", type=int, default=None, help="生成几个（默认 10）")
+    p_rc.add_argument("--force", action="store_true", help="覆盖已有恢复码")
+    p_rc.set_defaults(func=cmd_recovery_codes)
+
+    p_rr = sub.add_parser("recovery-reset", help="用恢复码重置主密码")
+    p_rr.set_defaults(func=cmd_recovery_reset)
+
+    # ── 安全审计 ──
+    p_ar = sub.add_parser("audit-report", help="安全审计报告（Watchtower 式）")
+    p_ar.set_defaults(func=cmd_audit_report)
+
+    args = ap.parse_args()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()

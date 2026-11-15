@@ -1,0 +1,22 @@
+# 绝不入库：真实凭据、密钥、会话、审计、隔离目录
+vault/
+*.secret.enc
+*.enc
+*.key
+vault.key*
+master.json
+backup/
+.panic-*/
+sessions/
+audit.log
+net.log
+guard-pending.json
+accounts.yaml
+
+# 运行时产物
+__pycache__/
+*.pyc
+node_modules/
+*.bak*
+*.bak[0-9]*
+.DS_Store
