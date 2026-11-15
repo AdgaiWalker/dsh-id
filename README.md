@@ -121,10 +121,26 @@ dsh-id session check github                                  # 探一次，判�
 ### 出事的时候
 
 ```bash
-dsh-id creds panic --dry-run    # 先看会做什么
-dsh-id creds panic              # 停服务 + 禁用开机自启 + 隔离全部密文
+dsh-id creds panic --dry-run    # 先看会做什么（顺带预览待吊销清单）
+dsh-id creds panic              # 停服务 + 禁用自启 + 隔离密文 + 生成待吊销清单
 dsh-id creds restore            # 一条命令回来（自动找最新隔离目录）
+dsh-id creds revoke-list        # 随时重生成：哪些 token/会话在平台上还没停
 ```
+
+`panic` 只隔离本地密文——**上游的 token、已经打开的网页会话都还活着**。
+所以 panic 会同时问你一件更重要的事：**去哪吊销**。
+
+```text
+【上游还没停】
+  ⚠ 1 个凭据 + 7 个会话在平台上依然有效，panic 管不到
+  清单: ~/.deepseekbot/vault/.panic-<时间戳>/REVOKE.md
+  - GitHub       github-pat  →  https://github.com/settings/tokens
+  - ChatGPT 会话  chatgpt     →  https://chatgpt.com/#settings/Security
+  - Google 会话   google      →  https://myaccount.google.com/deviceactivity
+```
+
+清单里只有名字和域名，没有任何凭据值；认识的平台直接给吊销/登出链接，
+不认识的就写「去该平台后台删」。恢复后清单留档为 `REVOKE-<时间戳>.md`。
 
 `panic` 不会删你的密钥文件——密文被挪进 `.panic-<时间戳>/`，随时可恢复。
 

@@ -31,6 +31,7 @@ import argparse
 import json
 import os
 import sys
+import tempfile
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -120,6 +121,156 @@ def cmd_rm(args):
         print(f"凭据 {args.name} 不存在")
 
 
+# 平台吊销入口：域名后缀 → (平台名, token 吊销页, 会话登出页)。None = 该平台没有这类页面。
+REVOKE_MAP = {
+    "github.com": ("GitHub", "https://github.com/settings/tokens",
+                   "https://github.com/settings/sessions"),
+    "cloudflare.com": ("Cloudflare", "https://dash.cloudflare.com/profile/api-tokens",
+                       "https://dash.cloudflare.com/profile"),
+    "vercel.com": ("Vercel", "https://vercel.com/account/tokens",
+                   "https://vercel.com/account/sessions"),
+    "openai.com": ("OpenAI", "https://platform.openai.com/api-keys",
+                   "https://chatgpt.com/#settings/Security"),
+    "anthropic.com": ("Anthropic", "https://console.anthropic.com/settings/keys", None),
+    "chatgpt.com": ("ChatGPT", None, "https://chatgpt.com/#settings/Security"),
+    "googleapis.com": ("Google", "https://myaccount.google.com/permissions",
+                       "https://myaccount.google.com/deviceactivity"),
+    "google.com": ("Google", "https://myaccount.google.com/permissions",
+                   "https://myaccount.google.com/deviceactivity"),
+    "x.com": ("X", "https://developer.x.com/en/portal/projects-and-apps",
+              "https://x.com/settings/sessions"),
+    "twitter.com": ("X", "https://developer.x.com/en/portal/projects-and-apps",
+                    "https://x.com/settings/sessions"),
+    "slack.com": ("Slack", "https://api.slack.com/apps", None),
+    "huggingface.co": ("Hugging Face", "https://huggingface.co/settings/tokens", None),
+    "modelscope.cn": ("ModelScope", "https://www.modelscope.cn/my/myaccesstoken", None),
+    "deepseek.com": ("DeepSeek", "https://platform.deepseek.com/api_keys", None),
+    "amazonaws.com": ("AWS",
+                      "https://console.aws.amazon.com/iam/home#/security_credentials", None),
+    "notion.so": ("Notion", "https://www.notion.so/my-integrations", None),
+    "stripe.com": ("Stripe", "https://dashboard.stripe.com/apikeys", None),
+}
+
+
+def _platform_key(host):
+    """把域名映射到吊销表里的后缀；认不出返回 None。"""
+    h = (host or "").strip().lower().split(":")[0].lstrip(".")
+    if not h:
+        return None
+    for suf in sorted(REVOKE_MAP, key=len, reverse=True):
+        if h == suf or h.endswith("." + suf):
+            return suf
+    return None
+
+
+def _as_list(v):
+    if v is None:
+        return []
+    if isinstance(v, str):
+        return [x for x in (s.strip() for s in v.split(",")) if x]
+    return [x for x in v if x]
+
+
+def _group(items, keyfn):
+    out = {}
+    for it in items:
+        out.setdefault(keyfn(it), []).append(it)
+    return out
+
+
+def build_revoke_report(creds, sessions, reason="panic"):
+    """生成「上游还没停」清单。只写名字/域名，绝不涉及凭据值。"""
+    import datetime as _dt
+    now_s = _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    L = ["# 待吊销清单", "",
+         f"生成时间: {now_s}",
+         f"触发原因: {reason}", "",
+         "> panic 只隔离了**本地**密文。下面这些在平台上依然有效，",
+         "> 要你自己去各自后台吊销/登出，否则拿旧凭据的人照样能用。", ""]
+
+    if creds:
+        L += [f"## 凭据（{len(creds)} 个）", ""]
+        for plat, items in _group(creds, lambda c: _platform_key(
+                (_as_list(c.get("domains")) or [""])[0])).items():
+            title = REVOKE_MAP[plat][0] if plat else "未识别平台"
+            L.append(f"- **{title}**：" + "、".join(c.get("name", "?") for c in items))
+            if plat:
+                _, token_url, _ = REVOKE_MAP[plat]
+                if token_url:
+                    L.append(f"  - 吊销: {token_url}")
+            else:
+                hosts = sorted({h for c in items for h in _as_list(c.get("domains"))})
+                L.append("  - 吊销: 去该平台「API keys / 开发者设置」删掉"
+                         + (f"（{', '.join(hosts)}）" if hosts else ""))
+        L.append("")
+    else:
+        L += ["## 凭据（0 个）", ""]
+
+    if sessions:
+        L += [f"## 网页会话（{len(sessions)} 个）", ""]
+        for plat, items in _group(sessions, lambda s: _platform_key(s.get("domain"))).items():
+            title = REVOKE_MAP[plat][0] if plat else "未识别站点"
+            L.append(f"- **{title}**：" + "、".join(s.get("name", "?") for s in items))
+            if plat and REVOKE_MAP[plat][2]:
+                L.append(f"  - 登出全部设备: {REVOKE_MAP[plat][2]}")
+            else:
+                doms = sorted({s.get("domain", "?") for s in items})
+                L.append(f"  - 登出: 去 {', '.join(doms)} 的「设置 → 安全/会话」逐个登出")
+        L.append("")
+    else:
+        L += ["## 网页会话（0 个）", ""]
+
+    L += ["## 做完之后", "",
+          "- 本地恢复: `dsh-id creds restore`",
+          "- 再看一遍漏没漏: `dsh-id creds revoke-list`", ""]
+    return "\n".join(L)
+
+
+def write_revoke_report(path, creds=None, sessions=None, reason="panic"):
+    creds = V.list_credentials() if creds is None else creds
+    sessions = V.list_sessions() if sessions is None else sessions
+    text = build_revoke_report(creds, sessions, reason=reason)
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        fh.write(text)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+    return path, len(creds), len(sessions)
+
+
+def print_revoke_summary(path, n_cred, n_sess, creds, sessions):
+    """终端只报摘要 + 直达链接，详情在文件里。"""
+    print()
+    print("【上游还没停】")
+    print(f"  ⚠ {n_cred} 个凭据 + {n_sess} 个会话在平台上依然有效，panic 管不到")
+    print(f"  清单: {path}")
+    for plat, items in _group(creds, lambda c: _platform_key(
+            (_as_list(c.get("domains")) or [""])[0])).items():
+        if plat and REVOKE_MAP[plat][1]:
+            print(f"  - {REVOKE_MAP[plat][0]:<12} " + "、".join(c.get("name", "?") for c in items)
+                  + f"  →  {REVOKE_MAP[plat][1]}")
+        else:
+            print(f"  - {'未识别平台':<10} " + "、".join(c.get("name", "?") for c in items)
+                  + "  →  去该平台后台删 key")
+    for plat, items in _group(sessions, lambda s: _platform_key(s.get("domain"))).items():
+        if plat and REVOKE_MAP[plat][2]:
+            print(f"  - {REVOKE_MAP[plat][0] + ' 会话':<12} " + "、".join(s.get("name", "?") for s in items)
+                  + f"  →  {REVOKE_MAP[plat][2]}")
+        else:
+            print(f"  - {'会话':<10} " + "、".join(s.get("name", "?") for s in items)
+                  + "  →  去各站「设置 → 会话」登出")
+
+
+def cmd_revoke_list(args):
+    path = args.out or os.path.join(V._vault_dir(), "REVOKE.md")
+    path, nc, ns = write_revoke_report(path, reason="手动生成")
+    print(f"已生成: {path}")
+    print(f"涉及 {nc} 个凭据、{ns} 个会话（只含名字与域名，不含任何凭据值）")
+    if not nc and not ns:
+        print("（没有需要吊销的东西）")
+
+
 def cmd_panic(args):
     res = V.panic(dry_run=args.dry_run)
 
@@ -131,6 +282,13 @@ def cmd_panic(args):
         for s in res["secrets"]:
             print(f"  - {s}")
         print(f"隔离目录:     {res['quarantine_dir']}")
+        print()
+        _tmp = os.path.join(tempfile.gettempdir(), "dsh-id-revoke-preview.md")
+        try:
+            _p, _nc, _ns = write_revoke_report(_tmp, reason="panic --dry-run 预览")
+            print_revoke_summary(_p, _nc, _ns, V.list_credentials(), V.list_sessions())
+        except Exception as exc:
+            print(f"⚠ 预览生成失败: {exc}")
         print()
         print("注意：vault.key 与元数据不会被删除，随时可恢复。")
         print("确认执行请运行: vault-cred panic")
@@ -155,6 +313,13 @@ def cmd_panic(args):
         print(f"⚠ {len(res['failed'])} 个文件挪动失败:")
         for p, err in res["failed"]:
             print(f"  - {os.path.basename(p)}: {err}")
+
+    try:
+        _rp, _nc, _ns = write_revoke_report(
+            os.path.join(res["quarantine_dir"], "REVOKE.md"), reason="panic")
+        print_revoke_summary(_rp, _nc, _ns, V.list_credentials(), V.list_sessions())
+    except Exception as exc:  # 清单生成失败不能盖住 panic 的结果
+        print(f"⚠ 待吊销清单生成失败: {exc}")
 
     print()
     print("恢复方法: vault-cred restore")
@@ -197,7 +362,10 @@ def cmd_restore(args):
 
     # 隔离目录清理结果
     if res.get("dir_removed"):
-        print("✓ 隔离目录已空，已自动删除")
+        if res.get("revoke_report_kept"):
+            print(f"✓ 待吊销清单已留档: {res['revoke_report_kept']}（隔离目录已删）")
+        else:
+            print("✓ 隔离目录已空，已自动删除")
     elif res.get("dir_kept"):
         left = res.get("dir_leftovers") or []
         print(f"⚠ 隔离目录未删（仍有 {len(left)} 项）: {', '.join(left) or '未知'}")
@@ -636,6 +804,10 @@ def main():
     p_revoke.add_argument("--approval-id", dest="approval_id",
                           help="vault-guard 批准后的 id")
     p_revoke.set_defaults(func=cmd_revoke)
+
+    p_rl = sub.add_parser("revoke-list", help="生成待吊销清单：哪些 token/会话在平台上还没停")
+    p_rl.add_argument("--out", help="输出路径，默认 <vault>/REVOKE.md")
+    p_rl.set_defaults(func=cmd_revoke_list)
 
     p_verify = sub.add_parser("audit-verify", help="校验审计日志哈希链完整性")
     p_verify.add_argument("--file", help="指定审计文件（默认 ~/.deepseekbot/vault/audit.log）")

@@ -1107,7 +1107,8 @@ def restore(stamp=None):
 
     target = None
     if stamp is None:
-        target = dirs[0]                      # 最新
+        # 优先挑真正有密文的最新目录（可能存在只放了 REVOKE.md 的目录）
+        target = next((d for d in dirs if d.get("count")), dirs[0])
     else:
         for d in dirs:
             if d["stamp"] == stamp or d["dir"] == stamp:
@@ -1137,6 +1138,14 @@ def restore(stamp=None):
         leftovers = os.listdir(target["dir"])
     except OSError:
         leftovers = []
+    if leftovers and all(fn == "REVOKE.md" for fn in leftovers):
+        try:
+            shutil.move(os.path.join(target["dir"], "REVOKE.md"),
+                        os.path.join(_vault_dir(), "REVOKE-%s.md" % target["stamp"]))
+            result["revoke_report_kept"] = "REVOKE-%s.md" % target["stamp"]
+            leftovers = []
+        except OSError:
+            pass
     if leftovers:
         result["dir_kept"] = True
         result["dir_leftovers"] = sorted(leftovers)
