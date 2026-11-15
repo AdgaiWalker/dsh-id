@@ -4,6 +4,8 @@
 
 为 [DeepSeek Harness](https://github.com/deepseek-ai) 生态写的，纯本地、无服务端、无遥测。
 
+![dsh-id](docs/screenshot.png)
+
 ---
 
 ## 解决什么问题
