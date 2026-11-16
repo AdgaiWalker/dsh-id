@@ -1,4 +1,4 @@
-# dsh-id bundle patch
+# dsh-account-vault bundle patch
 #
 # 挂载一个只读的账号与凭据「元数据状态」插件行。
 # 定位：本地只读管理/状态 MVP，不是登录执行器，也不是安全隔离产品。
@@ -12,6 +12,7 @@
 #   account_vault_guard_status       审批队列（只读，不能 approve）
 #   account_vault_audit_status       审计哈希链校验（重算每条 hash）
 #   account_vault_security_boundary  安全边界披露
+#   account_vault_panel              确保本机面板在跑并返回地址（127.0.0.1:8791）
 #
 # 配置可从 dsh 设置（命名空间 `account-vault`）修改：
 #   vaultDir      数据目录，默认 ~/.deepseekbot/vault
@@ -21,7 +22,9 @@
 # 注意：本包没有 dsh.client 前端，设置卡是否可视化需以 DSH 实机加载为准。
 - insert:
     - id: tool-account-vault
-      name: dsh-id
+      name: dsh-account-vault
       config:
-        # 同 dsh-account-vault：空串会被 pick() 当作有效值覆盖默认路径，故不写这两项。
+        # vaultDir / accountsFile 不要写空串：pick() 里 "" 是有效值，
+        # 会把默认路径 ~/.deepseekbot/vault 和 ~/.deepseekbot/accounts.yaml 覆盖成空。
+        # 不写这两项 → 落到默认；只有 probeUrl 的 "" 是"禁用探测"的语义。
         probeUrl: ""

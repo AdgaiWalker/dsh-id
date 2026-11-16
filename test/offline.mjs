@@ -51,9 +51,8 @@ async function ensureDeps() {
   console.error("\n  本测试需要能解析上面两个包（来自已安装的 DSH profile，不联网）。");
   console.error("  请在插件目录执行：\n");
   console.error("    mkdir -p node_modules/@deepseek-ai");
-  console.error("    PROFILE=${DSH_PROFILE:-~/.dsh/profiles/web}");
-  console.error("    ln -sfn $PROFILE/node_modules/@deepseek-ai/dsh-tools   node_modules/@deepseek-ai/dsh-tools");
-  console.error("    ln -sfn $PROFILE/node_modules/@deepseek-ai/schemastery node_modules/@deepseek-ai/schemastery\n");
+  console.error("    ln -sfn /home/happy/.dsh/profiles/web/node_modules/@deepseek-ai/dsh-tools   node_modules/@deepseek-ai/dsh-tools");
+  console.error("    ln -sfn /home/happy/.dsh/profiles/web/node_modules/@deepseek-ai/schemastery node_modules/@deepseek-ai/schemastery\n");
   console.error("  或使用 package.json 的 scripts（见 README）。\n");
   process.exit(3);
 }
@@ -297,7 +296,7 @@ async function main() {
   // 做法：在原始源码里找 spawn( 的实参表达式（字符串已被替换，所以看原文本）
   const spawnExprs = [...srcText.matchAll(/\bspawn\s*\(\s*([A-Za-z_$][\w$.]*|\([^)]*\)|"[^"]*")/g)]
     .map((m) => m[1]);
-  const allowedSpawnTargets = ["bin", "bins()", "/usr/bin/python3", "python3", "command"];
+  const allowedSpawnTargets = ["bin", "bins()", "/usr/bin/python3", "python3", "command", "SYSTEMCTL_BIN"];
   check("spawn 目标只来自白名单变量/常量",
     spawnExprs.every((e) => allowedSpawnTargets.some((a) => e.includes(a))),
     JSON.stringify([...new Set(spawnExprs)]));
@@ -324,8 +323,9 @@ async function main() {
     "account_vault_overview", "account_vault_accounts", "account_vault_account",
     "account_vault_credentials", "account_vault_sessions", "account_vault_guard_status",
     "account_vault_audit_status", "account_vault_security_boundary",
+    "account_vault_panel",
   ];
-  const EXPECTED_TOTAL = expected.length + 4; // 8 只读 + 4 执行
+  const EXPECTED_TOTAL = expected.length + 4; // 9 只读 + 4 执行
   check(`注册 ${EXPECTED_TOTAL} 个工具`, ctx._tools.size === EXPECTED_TOTAL,
     `实际 ${ctx._tools.size}: ${[...ctx._tools.keys()].join(",")}`);
   for (const n of expected) check(`存在 ${n}`, ctx._tools.has(n));
@@ -450,7 +450,7 @@ async function main() {
   const ctxB = makeCtx();
   mod.apply(ctxA, { vaultDir: join(TMP, "vaultA"), accountsFile: fx.accountsFile, probeUrl: "" });
   mod.apply(ctxB, { vaultDir: join(TMP, "vaultB"), accountsFile: fx.accountsFile, probeUrl: "" });
-  check("两实例各注册 12 个工具", ctxA._tools.size === 12 && ctxB._tools.size === 12,
+  check("两实例各注册 13 个工具", ctxA._tools.size === 13 && ctxB._tools.size === 13,
     `${ctxA._tools.size} / ${ctxB._tools.size}`);
   check("两实例工具表相互独立", ctxA._tools !== ctxB._tools);
   const dispA = await ctxA._tools.get("account_vault_credentials").execute({}, {});

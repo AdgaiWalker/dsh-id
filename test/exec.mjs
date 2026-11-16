@@ -204,7 +204,7 @@ async function main() {
   const execTools = ["account_vault_exec_curl", "account_vault_session_open",
     "account_vault_browser", "account_vault_browser_stop"];
   for (const n of execTools) check(`存在 ${n}`, ctx._tools.has(n));
-  check("工具总数 12", ctx._tools.size === 12, String(ctx._tools.size));
+  check("工具总数 13", ctx._tools.size === 13, String(ctx._tools.size));
 
   console.log("\n=== 2. exec_curl 成功路径 ===");
   process.env.MOCK_MODE = "";
