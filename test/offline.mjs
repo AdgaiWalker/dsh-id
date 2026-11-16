@@ -330,6 +330,23 @@ async function main() {
     `实际 ${ctx._tools.size}: ${[...ctx._tools.keys()].join(",")}`);
   for (const n of expected) check(`存在 ${n}`, ctx._tools.has(n));
 
+  // 面板工具：用假 systemctl 验证「确保在跑 + 返回地址」（不碰真实服务）
+  {
+    const fakeDir = await mkdtemp(join(tmpdir(), "dsh-av-sysctl-"));
+    const fake = join(fakeDir, "systemctl");
+    await writeFile(fake, "#!/bin/sh\ncase \"$*\" in *is-active*) echo active ;; *) exit 0 ;; esac\n", { mode: 0o755 });
+    process.env.DSH_ID_SYSTEMCTL = fake;
+    try {
+      const r = await ctx._tools.get("account_vault_panel").execute({}, {});
+      check("panel 工具返回本机地址", r.url === "http://127.0.0.1:8791", r.url);
+      check("panel 工具识别服务在跑", r.running === true, String(r.running));
+      check("panel 工具不乱开新实例", r.started_now === false, String(r.started_now));
+    } finally {
+      delete process.env.DSH_ID_SYSTEMCTL;
+      await rm(fakeDir, { recursive: true, force: true });
+    }
+  }
+
   console.log("\n=== 3. 工具执行 ===");
   const R = {};
   for (const n of expected) {
