@@ -1,0 +1,38 @@
+name: Bug 报告
+description: 有东西坏了 / 行为和预期不一样
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        提交前请先跑 `dsh-id doctor`。
+        **不要把凭据值、cookie、一次性验证码贴进来**——贴了请立刻去平台吊销。
+  - type: textarea
+    id: what
+    attributes:
+      label: 发生了什么
+      description: 一句话说清楚，加上你期望的结果
+      placeholder: 执行 dsh-id exec github-pat ... 报 exit 8，但凭据才建了 3 天
+    validations: { required: true }
+  - type: textarea
+    id: steps
+    attributes:
+      label: 复现步骤
+      placeholder: |
+        1. dsh-id creds add ...
+        2. dsh-id exec ...
+        3. 看到 ...
+    validations: { required: true }
+  - type: textarea
+    id: doctor
+    attributes:
+      label: 诊断报告
+      description: 贴 `dsh-id doctor --json` 的输出（只含版本/路径/状态，无凭据值）
+      render: json
+    validations: { required: true }
+  - type: input
+    id: env
+    attributes:
+      label: 环境
+      placeholder: Omarchy 4.5 / Python 3.14 / DSH 0.2.2-rc.1
+    validations: { required: false }
