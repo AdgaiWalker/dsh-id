@@ -13,6 +13,8 @@ import os
 import subprocess
 import sys
 import urllib.parse
+import urllib.error
+import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 sys.path.insert(0, os.path.expanduser("~/.local/lib"))
@@ -77,8 +79,10 @@ def state():
     except Exception:
         pending = 0
     qdirs = [d["stamp"] for d in V.list_quarantines()]
+    recent = V.recent_logs(20)
     return {"creds": creds, "sessions": sessions, "audit": audit,
-            "pending": pending, "quarantines": qdirs,
+            "pending": pending, "quarantines": qdirs, "logs": recent,
+            "version": V.VERSION, "repo": "AdgaiWalker/dsh-id",
             "vault": V._vault_dir(), "types": list(TYPES)}
 
 
@@ -176,6 +180,23 @@ def action(op, body):
         rc, out = _run("vault-cred", "revoke-list", "--out", p)
         return rc == 0, (out.strip().splitlines()[0] if out.strip() else p)
 
+    if op == "check_update":
+        try:
+            req = urllib.request.Request(
+                "https://api.github.com/repos/AdgaiWalker/dsh-id/releases/latest",
+                headers={"User-Agent": "dsh-id", "Accept": "application/vnd.github+json"})
+            with urllib.request.urlopen(req, timeout=6) as r:
+                latest = json.load(r).get("tag_name", "").lstrip("v")
+        except urllib.error.HTTPError as exc:
+            if exc.code == 404:
+                return True, f"仓库还没发过 release（当前 {V.VERSION}）"
+            return False, f"检查失败: HTTP {exc.code}"
+        except Exception as exc:
+            return False, f"检查失败（离线？）: {exc}"
+        newer = latest and latest != V.VERSION
+        return True, (f"有新版本 {latest}（当前 {V.VERSION}）" if newer
+                      else f"已是最新 {V.VERSION}")
+
     if op == "audit_verify":
         ok, problems, total, legacy = V.verify_chain()
         if ok is None:
@@ -245,6 +266,10 @@ class Handler(BaseHTTPRequestHandler):
             ok, msg = action(op, body)
         except Exception as exc:
             ok, msg = False, f"服务端错误: {exc}"
+        try:
+            V.app_log("panel_" + op, ok=ok, msg=msg[:120])
+        except Exception:
+            pass
         return self._send(200 if ok else 400,
                           json.dumps({"ok": ok, "message": msg}, ensure_ascii=False))
 

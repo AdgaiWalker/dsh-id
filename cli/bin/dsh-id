@@ -9,10 +9,14 @@
 
 不带参数时打印一屏状态，纯只读，不输出任何凭据值。
 """
+import json
 import os
+import platform
 import re
+import shutil
 import subprocess
 import sys
+import urllib.request
 
 BIN = os.path.expanduser("~/.local/bin")
 TARGETS = {
@@ -95,13 +99,133 @@ def status():
         "  exec    按需注入凭据发一次请求",
         "  guard   不可逆操作审批",
         "  panel   本机面板（127.0.0.1:8791）",
+        "  doctor  自检并生成可粘贴的诊断报告",
 
     ]
     print("\n".join(lines))
 
 
+REPO = "AdgaiWalker/dsh-id"
+RELEASES = f"https://api.github.com/repos/{REPO}/releases/latest"
+
+
+def _vaultlib():
+    sys.path.insert(0, os.path.expanduser("~/.local/lib"))
+    import vaultlib
+    return vaultlib
+
+
+def _latest_release(timeout=6):
+    """读 GitHub 最新 release；断网/超时返回 None（不猜）。"""
+    try:
+        req = urllib.request.Request(RELEASES, headers={
+            "User-Agent": "dsh-id", "Accept": "application/vnd.github+json"})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.load(r).get("tag_name", "").lstrip("v")
+    except Exception:
+        return None
+
+
+def _cmp_ver(a, b):
+    def parts(v):
+        return [int(x) for x in re.findall(r"\d+", v or "")] or [0]
+    pa, pb = parts(a), parts(b)
+    n = max(len(pa), len(pb))
+    pa += [0] * (n - len(pa)); pb += [0] * (n - len(pb))
+    return (pa > pb) - (pa < pb)
+
+
+def collect_checks(check_update=False):
+    V = _vaultlib()
+    out = []
+
+    def add(name, ok, detail, hint=""):
+        out.append({"name": name, "ok": ok, "detail": detail, "hint": hint})
+
+    py = ".".join(str(x) for x in sys.version_info[:3])
+    add("Python", sys.version_info[:2] >= (3, 10), py, "需要 3.10+")
+    ossl = shutil.which("openssl")
+    add("openssl", bool(ossl), ossl or "未找到", "装 openssl")
+
+    vd = V._vault_dir()
+    exists = os.path.isdir(vd)
+    mode = oct(os.stat(vd).st_mode & 0o777) if exists else "-"
+    add("数据目录", exists and mode == "0o700", f"{vd} ({mode})", "应为 700")
+    key = os.path.join(vd, "vault.key")
+    kh = os.path.exists(key)
+    kmode = oct(os.stat(key).st_mode & 0o777) if kh else "-"
+    add("密钥文件", kh and kmode == "0o600", f"{'存在' if kh else '缺失'} ({kmode})", "应为 600")
+
+    creds = V.list_credentials()
+    exp = [c["name"] for c in creds if V.lease_state(c)[0] == "expired"]
+    add("凭据", not exp, f"{len(creds)} 个" + (f"，已过期 {', '.join(exp)}" if exp else ""),
+        "dsh-id creds rotate <名字>")
+
+    sess = V.list_sessions()
+    okc, probs, total, legacy = V.verify_chain()
+    add("审计链", okc is True, {"ok": f"完整（{total} 行）", "unknown": "无法校验",
+                                "bad": f"{len(probs)} 处异常"}[
+        "ok" if okc else ("unknown" if okc is None else "bad")],
+        "dsh-id creds audit-verify")
+
+    pend = 0
+    try:
+        with open(os.path.join(vd, "guard-pending.json"), encoding="utf-8") as fh:
+            pend = len((json.load(fh) or {}).get("pending", []))
+    except Exception:
+        pass
+    add("待审批", pend == 0, f"{pend} 件", "dsh-id guard pending")
+
+    errs = [r for r in V.recent_logs(200)
+            if any(k in str(r.get("action", "")) for k in ("fail", "expired", "error"))]
+    add("最近错误", not errs, f"{len(errs)} 条" if errs else "无",
+        "dsh-id doctor --json 附在 issue 里")
+
+    if check_update:
+        latest = _latest_release()
+        if latest is None:
+            add("版本更新", None, f"当前 {V.VERSION}，检查失败（离线？）", "")
+        else:
+            newest = _cmp_ver(V.VERSION, latest) >= 0
+            add("版本更新", newest, f"当前 {V.VERSION}，最新 {latest}", "git pull 或用 release")
+    return out
+
+
+def doctor(args):
+    V = _vaultlib()
+    checks = collect_checks(getattr(args, "check_update", False))
+    if getattr(args, "json", False):
+        print(json.dumps({"version": V.VERSION, "os": platform.platform(),
+                          "python": sys.version.split()[0], "checks": checks},
+                         ensure_ascii=False, indent=2))
+        return 0
+    icon = {True: "✓", False: "✗", None: "?"}
+    bad = [c for c in checks if c["ok"] is False]
+    print(f"dsh-id {V.VERSION} · {platform.system()} · Python {sys.version.split()[0]}")
+    for c in checks:
+        line = f"  {icon[c['ok']]} {c['name']:<8} {c['detail']}"
+        if c["ok"] is False and c["hint"]:
+            line += f"   → {c['hint']}"
+        print(line)
+    print()
+    if bad:
+        print(f"{len(bad)} 项需要处理：" + "、".join(c["name"] for c in bad))
+        print("把 `dsh-id doctor --json` 的输出贴到 issue 里（不含任何凭据值）")
+    else:
+        print("全部正常。")
+    print(f"报告: dsh-id doctor --json   ·  反馈: https://github.com/{REPO}/issues/new/choose")
+    return 1 if bad else 0
+
+
 def main():
     argv = sys.argv[1:]
+    if argv and argv[0] in ("doctor", "check"):
+        class A:
+            json = "--json" in argv
+            check_update = "--check-update" in argv or "--update" in argv
+        return doctor(A)
+    if argv and argv[0] in ("version", "-V", "--version"):
+        return print(_vaultlib().VERSION)
     if not argv or argv[0] in ("-h", "--help", "help", "status"):
         return status()
     cmd = ALIASES.get(argv[0], argv[0])

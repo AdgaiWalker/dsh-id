@@ -121,6 +121,7 @@ def cmd_rotate(args):
     V.save_meta(meta)
     V.audit_event(action="rotate", cred=name, host="-", path="-", status=0,
                   note=f"lease={meta.get('lease_days')}")
+    V.app_log("rotate", cred=name)
     print(f"✓ 已轮换 {name}（租约 {meta.get('lease_days')} 天，从今天重新计）")
 
 
@@ -146,6 +147,7 @@ def cmd_lease(args):
             f"已过期 {abs(left)} 天" if state == "expired" else "无租约")
     V.audit_event(action="lease_set", cred=name, host="-", path="-", status=0,
                   note=f"lease_days={meta.get('lease_days')} reset={args.reset}")
+    V.app_log("lease", cred=name, days=meta.get("lease_days"))
     print(f"✓ {name}: 租约 {meta.get('lease_days')} 天（{tail}）")
 
 
@@ -349,6 +351,7 @@ def cmd_panic(args):
         print("确认执行请运行: vault-cred panic")
         return
 
+    V.app_log("panic", moved=len(res.get("moved") or []))
     print("=== PANIC 已执行 ===")
     if res["service_stopped"]:
         print("✓ 代理服务已停止（AI 立刻失去登录能力）")

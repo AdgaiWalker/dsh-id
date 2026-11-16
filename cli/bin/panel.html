@@ -44,7 +44,13 @@
 <body>
 <header>
   <h1>dsh-id · 账号面板</h1>
-  <div class="sub" id="vault">加载中…</div>
+  <div class="sub"><span id="ver">v…</span> · <span id="vault">加载中…</span></div>
+  <div class="row-actions" style="margin-top:8px">
+    <button id="btnUpdate">检查更新</button>
+    <a href="https://github.com/AdgaiWalker/dsh-id" target="_blank" rel="noreferrer"><button>仓库</button></a>
+    <a href="https://github.com/AdgaiWalker/dsh-id#readme" target="_blank" rel="noreferrer"><button>文档</button></a>
+    <button id="btnFeedback">报告问题</button>
+  </div>
 </header>
 <div class="warn">只绑 127.0.0.1。这一页能看到账号名和域名，永远看不到密码/令牌值。</div>
 <main>
@@ -70,6 +76,12 @@
   <section>
     <h2>网页会话 <span class="count" id="sessCount"></span></h2>
     <div id="sessions"></div>
+  </section>
+
+  <section>
+    <h2>运行日志 <span class="count" id="logCount"></span></h2>
+    <div id="logs"></div>
+    <div class="hint">按天一个文件，保留 14 天；只记动作/名字/主机/结果，不记 URL 与凭据值。</div>
   </section>
 
   <section>
@@ -119,6 +131,14 @@ async function load() {
   const r = await fetch("/api/state");
   const s = await r.json();
   $("#vault").textContent = s.vault;
+  $("#ver").textContent = "v" + s.version;
+  window.__state = s;
+  $("#logCount").textContent = s.logs.length + " 条";
+  $("#logs").innerHTML = table(["时间", "动作", "详情"], (s.logs.slice(-12).reverse()).map(l => [
+    `<span class="mono">${esc((l.ts || "").slice(11))}</span>`,
+    `<span class="mono">${esc(l.action)}</span>`,
+    `<span class="domains">${esc(Object.entries(l).filter(([k]) => k !== "ts" && k !== "action").map(([k, v]) => k + "=" + v).join(" "))}</span>`
+  ]));
   $("#credCount").textContent = s.creds.length + " 个";
   $("#sessCount").textContent = s.sessions.length + " 个";
   const leaseCell = (c) => c.lease_state === "none" ? '<span class="domains">无租约</span>'
@@ -189,6 +209,20 @@ $("#addForm").addEventListener("submit", async (e) => {
   const j = await post(body);
   if (j.ok) e.target.reset();
 });
+$("#btnUpdate").onclick = () => post({op: "check_update"});
+$("#btnFeedback").onclick = () => {
+  const s = window.__state || {};
+  const body = ["## 发生了什么", "", "（一句话描述）", "",
+    "## 诊断（自动生成，无凭据值）", "```json",
+    JSON.stringify({version: s.version, vault: s.vault, audit: s.audit,
+                    creds: (s.creds || []).map(c => [c.name, c.type, c.lease_state]),
+                    sessions: (s.sessions || []).map(x => [x.name, x.domain]),
+                    logs: (s.logs || []).slice(-5)}, null, 1),
+    "```"].join("\n");
+  const url = "https://github.com/AdgaiWalker/dsh-id/issues/new?labels=bug&title=" +
+    encodeURIComponent("[bug] ") + "&body=" + encodeURIComponent(body);
+  window.open(url, "_blank", "noopener");
+};
 $("#btnRevoke").onclick = () => post({op: "revoke_list"});
 $("#btnVerify").onclick = () => post({op: "audit_verify"});
 load();

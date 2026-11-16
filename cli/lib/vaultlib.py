@@ -880,6 +880,80 @@ def meta_exists(name) -> bool:
     return os.path.exists(_meta_path(name))
 
 
+VERSION = "0.1.0"
+LOG_KEEP_DAYS = 14
+
+
+def log_dir():
+    d = os.path.join(_vault_dir(), "logs")
+    os.makedirs(d, mode=0o700, exist_ok=True)
+    return d
+
+
+def _log_path(day=None):
+    import time as _t
+    day = day or _t.strftime("%Y-%m-%d", _t.localtime())
+    return os.path.join(log_dir(), f"dsh-id-{day}.log")
+
+
+def app_log(action, **fields):
+    """运行日志：只写动作/名字/主机/退出码这类非敏感字段。不写 URL、不写请求体、不写值。"""
+    import time as _t
+    rec = {"ts": _t.strftime("%Y-%m-%dT%H:%M:%S", _t.localtime()), "action": action}
+    for k, v in fields.items():
+        if v is None:
+            continue
+        rec[k] = v if isinstance(v, (int, float, bool)) else str(v)[:200]
+    path = _log_path()
+    try:
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        os.chmod(path, 0o600)
+    except OSError:
+        return None
+    _prune_logs()
+    return path
+
+
+def _prune_logs():
+    """保留最近 LOG_KEEP_DAYS 天。"""
+    try:
+        names = [n for n in os.listdir(log_dir()) if n.startswith("dsh-id-")]
+    except OSError:
+        return
+    keep = set()
+    import time as _t
+    for i in range(LOG_KEEP_DAYS):
+        keep.add("dsh-id-%s.log" % _t.strftime("%Y-%m-%d", _t.localtime(_t.time() - i * 86400)))
+    for n in names:
+        if n not in keep:
+            try:
+                os.remove(os.path.join(log_dir(), n))
+            except OSError:
+                pass
+
+
+def recent_logs(n=20):
+    out = []
+    try:
+        files = sorted(f for f in os.listdir(log_dir()) if f.startswith("dsh-id-"))
+    except OSError:
+        return out
+    for f in files:
+        try:
+            with open(os.path.join(log_dir(), f), encoding="utf-8") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if line:
+                        try:
+                            out.append(json.loads(line))
+                        except ValueError:
+                            continue
+        except OSError:
+            continue
+    return out[-n:]
+
+
 LEASE_DEFAULT_DAYS = 90
 
 

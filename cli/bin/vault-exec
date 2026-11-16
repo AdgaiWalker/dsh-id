@@ -170,6 +170,8 @@ def _load(cred):
         audit("exec_lease_expired", cred, note=f"overdue={_left}d")
         raise SystemExit(EXIT_EXPIRED)
 
+    V.app_log("exec", cred=cred, host=str(meta.get("domains") or ["?"])[:60])
+
     try:
         secret = V.load_secret(cred)
     except V.VaultError as e:
