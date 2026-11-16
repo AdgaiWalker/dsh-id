@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.1.1 — 2026-11-16
+
+**防封号：频率与熔断**
+- `vault-guard check "<操作>" --scope <账号>`：按账号查限额（默认发帖 3 条/天、间隔 30 分钟）
+- 超限 → `throttled` + exit 11，附原因与恢复办法
+- `vault-guard record ... [--fail]`：记真实结果；连续失败 2 次自动熔断
+- `vault-guard reset [--scope]`：查清原因后手动恢复
+- 规则写在 `guard-rules.yaml` 的 `rate_limits`，可改
+- 修：guardlib 支持 `VAULT_DIR_OVERRIDE`，测试不再碰生产状态
+
 ## 0.1.0 — 2026-11-16
 
 首个公开版本。给 AI Agent 用的账号执行层：凭据值不进日志、不进对话、不进 argv。

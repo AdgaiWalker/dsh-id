@@ -68,5 +68,18 @@ for args in "rotate nope" "lease nope --days 5"; do
   fi
 done
 
+echo "8) 频率/熔断（防封号）"
+export VAULT_DIR_OVERRIDE="$T/guard"; mkdir -p "$VAULT_DIR_OVERRIDE"
+vault-guard check "发一条帖子" --scope A >/dev/null && echo "   ✓ 首次 allow" || { echo "   ✗ 首次被拦"; exit 1; }
+vault-guard record "发一条帖子" --scope A >/dev/null
+set +e; vault-guard check "发一条帖子" --scope A >/dev/null 2>&1; c=$?; set -e
+[ "$c" = "11" ] && echo "   ✓ 间隔太近 → exit 11" || { echo "   ✗ 间隔检查失败 exit=$c"; exit 1; }
+vault-guard record "发一条帖子" --scope B --fail >/dev/null
+vault-guard record "发一条帖子" --scope B --fail >/dev/null
+set +e; vault-guard check "发一条帖子" --scope B >/dev/null 2>&1; c=$?; set -e
+[ "$c" = "11" ] && echo "   ✓ 连续失败熔断 → exit 11" || { echo "   ✗ 熔断失败 exit=$c"; exit 1; }
+vault-guard reset --scope B >/dev/null
+vault-guard check "发一条帖子" --scope B >/dev/null && echo "   ✓ reset 后恢复" || { echo "   ✗ reset 无效"; exit 1; }
+
 echo
 echo "全部通过"

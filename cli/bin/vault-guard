@@ -29,6 +29,7 @@ import guardlib as G  # noqa: E402
 
 EXIT_ALLOW = 0
 EXIT_APPROVAL = 10
+EXIT_THROTTLE = 11
 EXIT_ERROR = 1
 
 
@@ -45,6 +46,21 @@ def cmd_check(args):
             reason = "命中放行词: " + ", ".join(r["overrides"])
         elif r["readonly"]:
             reason = "只读操作"
+
+        rate = G.rate_check(action, scope=getattr(args, "scope", None))
+        if rate["decision"] == "throttled":
+            print("throttled")
+            print(f"  原因:    {rate['reason']}")
+            print(f"  规则:    {rate['key']}  {rate['rule']}")
+            print(f"  操作:    {action}")
+            print()
+            print("  ⚠ 先别做。等一会儿、或换账号、或查清失败原因后 vault-guard reset")
+            G._audit(action="guard_check", cred="-", host="-", path="-", status=11,
+                     note="throttled %s: %s" % (rate["key"], rate["reason"]))
+            sys.exit(EXIT_THROTTLE)
+
+        if rate["key"]:
+            reason += f"；{rate['reason']}"
         print(f"allow — {reason}")
         G._audit(action="guard_check", cred="-", host="-", path="-",
                  status=0, note="allow; action=%s" % action[:120])
@@ -63,6 +79,24 @@ def cmd_check(args):
              status=10,
              note="require_approval id=%s hits=%s" % (r["id"], ",".join(r["hits"])))
     sys.exit(EXIT_APPROVAL)
+
+
+def cmd_record(args):
+    res = G.record(" ".join(args.action).strip(),
+                   ok=not args.fail, scope=args.scope)
+    if not res:
+        print("（这条不在限速范围，没记）")
+        return
+    G._audit(action="guard_record", cred="-", host="-", path="-", status=0,
+             note=f"{res['key']} ok={not args.fail} count={res['count']} fails={res['fails']}")
+    print(f"{res['key']}: 今日 {res['count']} 条，连续失败 {res['fails']} 次")
+
+
+def cmd_reset(args):
+    G.reset(scope=args.scope)
+    G._audit(action="guard_reset", cred="-", host="-", path="-", status=0,
+             note=f"scope={args.scope or 'all'}")
+    print(f"已重置{'（' + args.scope + '）' if args.scope else '全部账号'}的限速与熔断状态")
 
 
 def cmd_pending(args):
@@ -121,6 +155,12 @@ def cmd_status(args):
 
 
 def cmd_rules(args):
+    rules = G.load_rate_rules()
+    print("限速 / 熔断规则:")
+    for k, v in rules.items():
+        print(f"  {k}: 每日上限 {v.get('max_per_day')} 条 · 最小间隔 "
+              f"{v.get('min_interval_minutes')} 分钟 · 连续失败 {v.get('max_consecutive_failures')} 次熔断")
+    print()
     rules = G.load_rules()
     print(f"规则文件: {G.RULES_FILE}")
     print(f"危险词 {len(rules.get('danger') or [])} 个:")
@@ -137,7 +177,18 @@ def main():
 
     p_check = sub.add_parser("check", help="检查操作是否需要批准（AI 调用）")
     p_check.add_argument("action", nargs="+", help="操作描述")
+    p_check.add_argument("--scope", help="账号/对象名，按它分别计数与熔断")
     p_check.set_defaults(func=cmd_check)
+
+    p_rec = sub.add_parser("record", help="记一次实际操作（供上限/间隔/熔断）")
+    p_rec.add_argument("action", nargs="+")
+    p_rec.add_argument("--scope", help="账号/对象名，按它分别计数")
+    p_rec.add_argument("--fail", action="store_true", help="这次失败了（连续失败会计入熔断）")
+    p_rec.set_defaults(func=cmd_record)
+
+    p_rst = sub.add_parser("reset", help="重置限速与熔断状态")
+    p_rst.add_argument("--scope")
+    p_rst.set_defaults(func=cmd_reset)
 
     p_pending = sub.add_parser("pending", help="列出待批准项")
     p_pending.set_defaults(func=cmd_pending)

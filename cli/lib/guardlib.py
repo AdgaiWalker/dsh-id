@@ -24,9 +24,26 @@ import sys
 import time
 import uuid
 
-VAULT_DIR = os.path.expanduser("~/.deepseekbot/vault")
+def _vault_dir():
+    """与 vaultlib 一致：测试用 VAULT_DIR_OVERRIDE / VAULT_DIR 隔离，别碰生产。"""
+    return (os.environ.get("VAULT_DIR_OVERRIDE") or os.environ.get("VAULT_DIR")
+            or os.path.expanduser("~/.deepseekbot/vault"))
+
+
+VAULT_DIR = _vault_dir()
 RULES_FILE = os.path.join(VAULT_DIR, "guard-rules.yaml")
 PENDING_FILE = os.path.join(VAULT_DIR, "guard-pending.json")
+STATE_FILE = os.path.join(VAULT_DIR, "guard-state.json")
+
+# 频率/熔断默认值：规则文件没写 rate_limits 时用这套
+RATE_DEFAULTS = {
+    "publish": {
+        "match": ["发布", "发帖", "发一条", "post", "publish", "tweet"],
+        "max_per_day": 3,
+        "min_interval_minutes": 30,
+        "max_consecutive_failures": 2,
+    },
+}
 
 # 英文词边界匹配：避免 "form" 里的 "rm"、"display" 里的 "play" 误判
 _WORD_RE_CACHE = {}
@@ -125,6 +142,102 @@ def check(text):
 
 
 # ── 待批准队列 ──────────────────────────────────────────────────────────────
+
+def load_rate_rules():
+    rules = load_rules().get("rate_limits") or {}
+    return rules if rules else RATE_DEFAULTS
+
+
+def _today():
+    return time.strftime("%Y-%m-%d", time.localtime())
+
+
+def _load_state():
+    try:
+        with open(STATE_FILE, encoding="utf-8") as fh:
+            return json.load(fh) or {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _save_state(state):
+    tmp = STATE_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(state, fh, ensure_ascii=False, indent=1)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, STATE_FILE)
+
+
+def _bucket(state, scope, key):
+    sc = state.setdefault("scopes", {}).setdefault(scope or "-", {"actions": {}})
+    b = sc["actions"].setdefault(key, {"day": _today(), "count": 0, "last_ts": 0, "fails": 0})
+    if b.get("day") != _today():          # 跨天自动清零
+        b.update({"day": _today(), "count": 0})
+    return b
+
+
+def _rule_for(text):
+    """命中哪条限速规则（返回 (key, rule) 或 (None, None)）。"""
+    rules = load_rate_rules()
+    for key, rule in rules.items():
+        words = rule.get("match") or []
+        if _matches(text, words):
+            return key, rule
+    return None, None
+
+
+def rate_check(text, scope=None):
+    """频率/熔断检查。返回 dict(decision=allow|throttled, reason, key, rule)。"""
+    key, rule = _rule_for(text)
+    if not key:
+        return {"decision": "allow", "reason": "不在限速范围", "key": None, "rule": None}
+    b = _bucket(_load_state(), scope, key)
+    cap = int(rule.get("max_per_day", 0) or 0)
+    gap = int(rule.get("min_interval_minutes", 0) or 0) * 60
+    breaker = int(rule.get("max_consecutive_failures", 0) or 0)
+
+    if breaker and b.get("fails", 0) >= breaker:
+        return {"decision": "throttled",
+                "reason": f"断路器已打开（连续失败 {b['fails']} 次）；先查原因再 vault-guard reset",
+                "key": key, "rule": rule}
+    if cap and b.get("count", 0) >= cap:
+        return {"decision": "throttled",
+                "reason": f"今日已达上限（{b['count']}/{cap} 条）", "key": key, "rule": rule}
+    if gap and b.get("last_ts"):
+        left = gap - (int(time.time()) - int(b["last_ts"]))
+        if left > 0:
+            return {"decision": "throttled",
+                    "reason": f"距上次太近，还需等 {left // 60} 分钟", "key": key, "rule": rule}
+    return {"decision": "allow", "reason": f"限速通过（今日 {b.get('count', 0)}/{cap or '∞'}）",
+            "key": key, "rule": rule}
+
+
+def record(text, ok=True, scope=None):
+    """记一次实际操作结果，供上限/间隔/熔断使用。"""
+    key, rule = _rule_for(text)
+    if not key:
+        return None
+    state = _load_state()
+    b = _bucket(state, scope, key)
+    if ok:
+        b["count"] = int(b.get("count", 0)) + 1
+        b["fails"] = 0
+    else:
+        b["fails"] = int(b.get("fails", 0)) + 1
+    b["last_ts"] = int(time.time())
+    _save_state(state)
+    return {"key": key, "count": b["count"], "fails": b["fails"]}
+
+
+def reset(scope=None):
+    state = _load_state()
+    if scope is None:
+        state = {"scopes": {}}
+    else:
+        state.get("scopes", {}).pop(scope, None)
+    _save_state(state)
+    return True
+
 
 def _load_pending():
     if not os.path.exists(PENDING_FILE):

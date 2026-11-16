@@ -216,6 +216,30 @@ dsh-id guard check "删除生产库" # → require_approval / allow
 
 ---
 
+## 防封号：频率与熔断
+
+Agent 用你的账号干活，最容易出事的是**节奏不像人**。guard 带一层按账号计的限额：
+
+```bash
+dsh-id guard check "发一条帖子" --scope x-main     # allow / throttled(exit 11)
+dsh-id guard record "发一条帖子" --scope x-main     # 记一次成功（今日 +1，重置连续失败）
+dsh-id guard record "发一条帖子" --scope x-main --fail   # 记一次失败
+dsh-id guard reset --scope x-main                 # 查清原因后手动恢复正常时
+```
+
+默认（`guard-rules.yaml` 的 `rate_limits`，可改）：发帖 **3 条/天**、两次之间至少 **30 分钟**、连续失败 **2 次**自动熔断。
+
+```text
+$ dsh-id guard check "发一条帖子" --scope x-main
+throttled
+  原因:    距上次太近，还需等 30 分钟
+  规则:    publish  {'max_per_day': 3, 'min_interval_minutes': 30, ...}
+  ⚠ 先别做。等一会儿、或换账号、或查清失败原因后 vault-guard reset
+exit=11
+```
+
+这只是降低概率，**不保证不封**。真封了：删会话重登、`creds panic` 吊销、换账号，系统照常。
+
 ## 维护通道（哪里错了能改）
 
 | 通道 | 怎么用 |

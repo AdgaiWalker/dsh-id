@@ -880,7 +880,7 @@ def meta_exists(name) -> bool:
     return os.path.exists(_meta_path(name))
 
 
-VERSION = "0.1.0"
+VERSION = "0.1.1"
 LOG_KEEP_DAYS = 14
 
 
