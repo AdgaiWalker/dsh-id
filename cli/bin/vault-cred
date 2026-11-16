@@ -50,6 +50,12 @@ def _read_secret(prompt):
     return sys.stdin.read().strip()
 
 
+def _die(msg):
+    """统一的用户级错误退出（exit 2），不要用 NameError 暴露内部状态。"""
+    print(f"vault-cred: {msg}", file=sys.stderr)
+    sys.exit(2)
+
+
 def cmd_add(args):
     name = args.name
     ctype = args.type
@@ -102,17 +108,84 @@ def cmd_add(args):
     print(f"  用法（常驻代理，需先自行启动 vault-proxy）: curl {PROXY}/{name}/<host>/<path>")
 
 
+GITHUB_API = os.environ.get("DSH_ID_GITHUB_API", "https://api.github.com")
+
+
+def _b64u(raw):
+    import base64
+    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
+
+
+def _github_app_jwt(app_id, key_path):
+    """RS256 JWT（10 分钟上限；GitHub 要求 exp ≤ 10min）。用 openssl 签，免装 cryptography。"""
+    import subprocess as _sp
+    import time as _t
+    head = _b64u(json.dumps({"alg": "RS256", "typ": "JWT"}, separators=(",", ":")).encode())
+    payload = _b64u(json.dumps({"iat": int(_t.time()) - 60,
+                                "exp": int(_t.time()) + 540,
+                                "iss": str(app_id)}, separators=(",", ":")).encode())
+    signing_input = f"{head}.{payload}".encode()
+    r = _sp.run(["openssl", "dgst", "-sha256", "-sign", key_path],
+                input=signing_input, capture_output=True)
+    if r.returncode != 0:
+        raise SystemExit("openssl 签名失败: " + r.stderr.decode()[:200])
+    return f"{head}.{payload}.{_b64u(r.stdout)}"
+
+
+def cmd_mint(args):
+    """用 GitHub App 换 1 小时令牌，写进保险库（到期自动失效，不必长期保存 pat）。"""
+    if not os.path.exists(args.key):
+        _die(f"私钥不存在: {args.key}")
+    try:
+        jwt = _github_app_jwt(args.app_id, args.key)
+    except SystemExit as e:
+        _die(str(e))
+    url = f"{GITHUB_API}/app/installations/{args.installation}/access_tokens"
+    import urllib.request as _u
+    import urllib.error as _ue
+    req = _u.Request(url, method="POST", headers={
+        "Authorization": f"Bearer {jwt}", "Accept": "application/vnd.github+json",
+        "User-Agent": "dsh-id", "Content-Length": "0"})
+    try:
+        with _u.urlopen(req, timeout=15) as r:
+            body = json.load(r)
+    except _ue.HTTPError as e:
+        _die(f"GitHub 拒绝（HTTP {e.code}）: {e.read()[:200].decode(errors='replace')}")
+    except Exception as e:
+        _die(f"请求失败: {e}")
+    token = body.get("token")
+    if not token:
+        _die("GitHub 没返回 token")
+    name = args.name
+    # 覆盖写入：短时令牌，不需要租约（expires_at 由 GitHub 决定）
+    meta = {"name": name, "type": "bearer",
+            "domains": [d.strip() for d in args.domains.split(",") if d.strip()],
+            "created_at": int(__import__("time").time()), "lease_days": 0,
+            "minted": "github-app", "app_id": str(args.app_id),
+            "installation": str(args.installation),
+            "expires_at": body.get("expires_at")}
+    V.save_secret(name, token)
+    V.save_meta(meta)
+    V.app_log("mint", cred=name, provider="github-app", expires=body.get("expires_at"))
+    V.audit_event(action="mint", cred=name, host=meta["domains"][0] if meta["domains"] else "-",
+                  path="-", status=0, note="github-app token")
+    exp = body.get("expires_at", "?")
+    print(f"✓ 已签发 {name}（GitHub App 安装令牌，GitHub 侧到期: {exp}）")
+    print(f"  白名单: {', '.join(meta['domains'])}")
+    print(f"  用: dsh-id exec {name} https://api.github.com/user")
+
+
 def cmd_rotate(args):
     """只换值，不换身份：类型/白名单/租约都保留，created_at 重置。"""
     name = args.name
     try:
         meta = V.load_meta(name)
     except V.VaultError:
-        return err(f"凭据不存在: {name}（新增用 vault-cred add）")
+        _die(f"凭据不存在: {name}（新增用 vault-cred add）")
     hint = "输入新凭据值（不回显）: " if meta.get("type") != "basic" else "输入 user:pass（不回显）: "
     value = _read_secret(hint)
     if not value:
-        return err("值为空，未轮换")
+        _die("值为空，未轮换")
     V.save_secret(name, value)
     meta["created_at"] = int(__import__("time").time())
     meta["rotated_at"] = meta["created_at"]
@@ -131,16 +204,16 @@ def cmd_lease(args):
     try:
         meta = V.load_meta(name)
     except V.VaultError:
-        return err(f"凭据不存在: {name}")
+        _die(f"凭据不存在: {name}")
     days = args.days
     if days is not None:
         if days < 0:
-            return err("租约天数不能是负数")
+            _die("租约天数不能是负数")
         meta["lease_days"] = days
     if args.reset:
         meta["created_at"] = int(__import__("time").time())
     elif not args.days and "lease_days" not in meta:
-        return err("没有可改的租约；用 --days N 指定（0=取消租约）")
+        _die("没有可改的租约；用 --days N 指定（0=取消租约）")
     V.save_meta(meta)
     state, left = V.lease_state(meta)
     tail = (f"剩 {left} 天" if state == "ok" else
@@ -874,6 +947,14 @@ def main():
     p_ls.add_argument("--days", type=int, help="租约天数，0=取消租约")
     p_ls.add_argument("--reset", action="store_true", help="从今天重新计时")
     p_ls.set_defaults(func=cmd_lease)
+
+    p_mint = sub.add_parser("mint", help="用 GitHub App 签发短时令牌（1 小时，自动过期）")
+    p_mint.add_argument("name")
+    p_mint.add_argument("--app-id", required=True)
+    p_mint.add_argument("--installation", required=True)
+    p_mint.add_argument("--key", required=True, help="App 私钥 .pem 路径")
+    p_mint.add_argument("--domains", default="api.github.com")
+    p_mint.set_defaults(func=cmd_mint)
 
     p_rot = sub.add_parser("rotate", help="轮换凭据值（身份/白名单不变，租约重新计时）")
     p_rot.add_argument("name")

@@ -145,6 +145,19 @@ dsh-id creds revoke-list        # 随时重生成：哪些 token/会话在平台
 
 `panic` 不会删你的密钥文件——密文被挪进 `.panic-<时间戳>/`，随时可恢复。
 
+### 短时令牌（GitHub App，1 小时自动过期）
+
+不存长期 PAT：用 App 私钥现换一个 1 小时的安装令牌，过期了再换。
+
+```bash
+dsh-id creds mint gh-app --app-id 123456 --installation 7890 --key ~/.config/dsh-id/app.pem
+dsh-id exec gh-app https://api.github.com/user        # 令牌已注入，不需要长令牌
+```
+
+- JWT 由 `openssl` 现签（RS256，exp ≤ 10 分钟），不引入额外依赖
+- 换到的令牌写进保险库，GitHub 侧到期时间会记进元数据
+- 测试用本地 mock（`DSH_ID_GITHUB_API`）跑通全流程，不碰真 GitHub
+
 ### 面板（不用记命令）
 
 ```bash

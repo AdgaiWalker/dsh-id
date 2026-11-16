@@ -58,5 +58,15 @@ echo "6) 磁盘上是密文"
 file "$T/.deepseekbot/vault/proxy/testcred.secret.enc" | grep -q "openssl enc'd data" \
   && echo "   ✓ openssl enc'd data（600）" || { echo "   ✗ 不是密文"; exit 1; }
 
+echo "7) 错误路径要报错退出，不能 NameError"
+for args in "rotate nope" "lease nope --days 5"; do
+  set +e; out="$(vault-cred $args </dev/null 2>&1)"; code=$?; set -e
+  if [ "$code" = "2" ] && echo "$out" | grep -q "vault-cred:"; then
+    echo "   ✓ vault-cred $args → exit 2"
+  else
+    echo "   ✗ vault-cred $args → exit $code / $out"; exit 1
+  fi
+done
+
 echo
 echo "全部通过"
