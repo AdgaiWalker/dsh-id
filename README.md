@@ -36,6 +36,7 @@ dsh-id exec github-pat https://api.github.com/user
 | `dsh-id session` | 网页登录态：**登录一次**存下 cookie/localStorage，之后直接是登录态（2FA 只过一次） |
 | `dsh-id creds` | 凭据增删查测、改主密码、`panic` 一键吊销、`restore` 恢复、审计链校验 |
 | `dsh-id guard` | 不可逆操作闸门：删除/转账/发布这类动作先记一条待批准 |
+| `dsh-id panel` | 本机网页面板（127.0.0.1:8791）：看账号/会话/审计，增删改凭据 |
 | `dsh-id` | 不带参数：一屏状态（凭据数、会话数、审计链、待审批） |
 
 底层是五个独立可用的 CLI（`vault-cred` / `vault-session` / `vault-exec` / `vault-guard` / `vault-proxy`），`dsh-id` 只是统一入口，不改变它们的行为。
@@ -143,6 +144,19 @@ dsh-id creds revoke-list        # 随时重生成：哪些 token/会话在平台
 不认识的就写「去该平台后台删」。恢复后清单留档为 `REVOKE-<时间戳>.md`。
 
 `panic` 不会删你的密钥文件——密文被挪进 `.panic-<时间戳>/`，随时可恢复。
+
+### 面板（不用记命令）
+
+```bash
+dsh-id panel            # → http://127.0.0.1:8791
+dsh-id panel --port 9000
+```
+
+一页看完：凭据（名字/类型/白名单）、会话（域名/保存/有效期）、审计链状态、待审批、隔离目录。
+能改：新增凭据、改白名单、删凭据、删会话、探会话、生成待吊销清单。
+
+只绑 `127.0.0.1`；写操作要求自定义头 + Origin 校验（挡浏览器跨站请求）；**页面永远不显示凭据值**，
+新增时值只经一次 POST 交给 `vault-cred`（走 stdin），不落盘、不回显、不进日志。
 
 ### 账目与审计
 

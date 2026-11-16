@@ -1,0 +1,243 @@
+#!/usr/bin/env python3
+"""dsh-id panel — 本机账号与凭据面板（只绑 127.0.0.1）。
+
+看：凭据名/类型/白名单、网页会话/有效期、审计链状态。
+改：新增凭据、改白名单、删凭据、删会话、生成待吊销清单。
+
+绝不返回凭据值：明文只在 POST 进来的一瞬间交给 vault-cred（走 stdin），
+不落盘、不回显、不进日志。
+"""
+import argparse
+import json
+import os
+import subprocess
+import sys
+import urllib.parse
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+sys.path.insert(0, os.path.expanduser("~/.local/lib"))
+import vaultlib as V  # noqa: E402
+
+BIN = os.path.expanduser("~/.local/bin")
+TYPES = ("bearer", "basic", "header", "query")
+TOKEN = "dsh-id-panel"          # 自定义请求头，挡住浏览器跨站简单请求
+PAGE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "panel.html")
+
+
+def _run(cmd, *args, stdin_data=None):
+    try:
+        r = subprocess.run([os.path.join(BIN, cmd), *args], input=stdin_data,
+                           capture_output=True, text=True, timeout=60)
+        return r.returncode, (r.stdout or "") + (r.stderr or "")
+    except Exception as exc:
+        return 99, f"{exc}"
+
+
+def _norm_domains(v):
+    if isinstance(v, str):
+        v = v.strip().strip("[]").replace("'", "").replace('"', "")
+        return [x.strip() for x in v.split(",") if x.strip()]
+    return [str(x) for x in (v or [])]
+
+
+def state():
+    creds = []
+    for m in V.list_credentials():
+        creds.append({
+            "name": m.get("name", "?"),
+            "type": m.get("type", "?"),
+            "domains": _norm_domains(m.get("domains")),
+            "created": m.get("created_at", ""),
+        })
+    sessions = []
+    for s in V.list_sessions():
+        sessions.append({
+            "name": s.get("name", "?"),
+            "domain": s.get("domain", "?"),
+            "saved": s.get("saved_at_str", ""),
+            "expires": s.get("expires_at_str", ""),
+            "cookies": s.get("cookies", ""),
+        })
+    ok, problems, total, legacy = V.verify_chain()
+    if ok is None:
+        audit = {"state": "unknown", "detail": problems[0][1] if problems else "", "rows": total}
+    elif ok:
+        audit = {"state": "ok", "rows": total, "legacy": legacy}
+    else:
+        audit = {"state": "broken", "rows": total,
+                 "detail": "; ".join(f"第{n}行 {m}" for n, m in problems[:3])}
+    pending = 0
+    try:
+        with open(os.path.join(V._vault_dir(), "guard-pending.json"), encoding="utf-8") as fh:
+            pending = len((json.load(fh) or {}).get("pending", []))
+    except Exception:
+        pending = 0
+    qdirs = [d["stamp"] for d in V.list_quarantines()]
+    return {"creds": creds, "sessions": sessions, "audit": audit,
+            "pending": pending, "quarantines": qdirs,
+            "vault": V._vault_dir(), "types": list(TYPES)}
+
+
+def action(op, body):
+    """返回 (ok, 说明)。所有写操作走现有 CLI，不重写加密逻辑。"""
+    if op == "cred_add":
+        name = str(body.get("name", "")).strip()
+        ctype = str(body.get("type", "")).strip()
+        secret = str(body.get("secret", ""))
+        domains = ",".join(_norm_domains(body.get("domains")))
+        if not name or not secret or not domains or ctype not in TYPES:
+            return False, "名字/类型/白名单/值 都要填"
+        args = ["add", name, ctype, "--domains", domains]
+        if ctype == "header":
+            hn = str(body.get("header_name", "")).strip()
+            if not hn:
+                return False, "header 类型要填请求头名"
+            args += ["--header-name", hn]
+        if ctype == "query":
+            pn = str(body.get("param_name", "")).strip()
+            if not pn:
+                return False, "query 类型要填参数名"
+            args += ["--param-name", pn]
+        rc, out = _run("vault-cred", *args, stdin_data=secret + "\n")
+        if rc != 0:
+            return False, out.strip().splitlines()[-1] if out.strip() else "新增失败"
+        V.audit_event(action="panel_cred_add", cred=name, host=domains.split(",")[0],
+                      path="-", status=0, note="via dsh-id panel")
+        return True, f"已新增 {name}"
+
+    if op == "cred_rm":
+        name = str(body.get("name", "")).strip()
+        if not name:
+            return False, "缺名字"
+        V.remove_credential(name)
+        V.audit_event(action="panel_cred_rm", cred=name, host="-", path="-",
+                      status=0, note="via dsh-id panel")
+        return True, f"已删除 {name}"
+
+    if op == "cred_domains":
+        name = str(body.get("name", "")).strip()
+        domains = _norm_domains(body.get("domains"))
+        if not name or not domains:
+            return False, "缺名字或白名单"
+        path = os.path.join(V.proxy_dir(), f"{name}.meta.json")
+        if not os.path.exists(path):
+            return False, "凭据不存在"
+        with open(path, encoding="utf-8") as fh:
+            meta = json.load(fh)
+        meta["domains"] = domains
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(meta, fh, ensure_ascii=False)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+        V.audit_event(action="panel_cred_domains", cred=name, host=domains[0],
+                      path="-", status=0, note="via dsh-id panel")
+        return True, f"{name} 白名单已改为 {', '.join(domains)}"
+
+    if op == "session_rm":
+        name = str(body.get("name", "")).strip()
+        if not name:
+            return False, "缺名字"
+        V.remove_session(name)
+        V.audit_event(action="panel_session_rm", cred=name, host="-", path="-",
+                      status=0, note="session removed via dsh-id panel")
+        return True, f"已删除会话 {name}"
+
+    if op == "session_check":
+        name = str(body.get("name", "")).strip()
+        rc, out = _run("vault-session", "check", name)
+        tail = " ".join(out.strip().splitlines()[-2:])[:200]
+        return rc == 0, (tail or "已检查")
+
+    if op == "revoke_list":
+        p = os.path.join(V._vault_dir(), "REVOKE.md")
+        rc, out = _run("vault-cred", "revoke-list", "--out", p)
+        return rc == 0, (out.strip().splitlines()[0] if out.strip() else p)
+
+    if op == "audit_verify":
+        ok, problems, total, legacy = V.verify_chain()
+        if ok is None:
+            return False, problems[0][1] if problems else "无法校验"
+        if ok:
+            return True, f"哈希链完整（{total} 行，旧格式 {legacy} 行）"
+        return False, f"发现 {len(problems)} 处问题，第一处：第{problems[0][0]}行 {problems[0][1]}"
+
+    return False, f"不认识的操作 {op}"
+
+
+class Handler(BaseHTTPRequestHandler):
+    server_version = "dsh-id-panel"
+
+    def log_message(self, fmt, *args):   # 不记录请求体，避免任何值进日志
+        sys.stderr.write("%s %s\n" % (self.log_date_time_string(), fmt % args))
+
+    def _send(self, code, body, ctype="application/json; charset=utf-8"):
+        raw = body.encode("utf-8") if isinstance(body, str) else body
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(raw)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.end_headers()
+        self.wfile.write(raw)
+
+    def _origin_ok(self):
+        origin = self.headers.get("Origin")
+        if not origin:
+            return True
+        host = self.headers.get("Host", "")
+        return origin in (f"http://{host}", f"http://127.0.0.1:{self.server.server_port}",
+                          f"http://localhost:{self.server.server_port}")
+
+    def do_GET(self):
+        path = urllib.parse.urlparse(self.path).path
+        if path == "/":
+            try:
+                with open(PAGE, encoding="utf-8") as fh:
+                    return self._send(200, fh.read(), "text/html; charset=utf-8")
+            except OSError:
+                return self._send(500, "panel.html missing", "text/plain; charset=utf-8")
+        if path == "/api/state":
+            if not self._origin_ok():
+                return self._send(403, json.dumps({"error": "origin"}))
+            return self._send(200, json.dumps(state(), ensure_ascii=False))
+        return self._send(404, json.dumps({"error": "not found"}))
+
+    def do_POST(self):
+        path = urllib.parse.urlparse(self.path).path
+        if path != "/api/action":
+            return self._send(404, json.dumps({"error": "not found"}))
+        # 三大门槛：自定义头 + Origin 校验 + JSON Content-Type
+        if self.headers.get("X-DSH-ID") != TOKEN or not self._origin_ok():
+            return self._send(403, json.dumps({"error": "forbidden"}, ensure_ascii=False))
+        if "application/json" not in (self.headers.get("Content-Type") or ""):
+            return self._send(415, json.dumps({"error": "json only"}, ensure_ascii=False))
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+            body = json.loads(self.rfile.read(n) or b"{}")
+        except Exception:
+            return self._send(400, json.dumps({"error": "bad json"}, ensure_ascii=False))
+        op = str(body.pop("op", ""))
+        try:
+            ok, msg = action(op, body)
+        except Exception as exc:
+            ok, msg = False, f"服务端错误: {exc}"
+        return self._send(200 if ok else 400,
+                          json.dumps({"ok": ok, "message": msg}, ensure_ascii=False))
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="dsh-id panel")
+    ap.add_argument("--port", type=int, default=8791)
+    a = ap.parse_args()
+    srv = ThreadingHTTPServer(("127.0.0.1", a.port), Handler)
+    print(f"dsh-id panel → http://127.0.0.1:{a.port}  (仅本机)")
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        pass
+
+
+if __name__ == "__main__":
+    main()

@@ -20,6 +20,7 @@ TARGETS = {
     "session": "vault-session",
     "exec": "vault-exec",
     "guard": "vault-guard",
+    "panel": "dsh-id-panel",
 }
 ALIASES = {"cred": "creds", "credo": "creds", "sessions": "session", "sess": "session"}
 
@@ -36,11 +37,9 @@ def run(cmd, *args):
 
 
 def count_rows(text):
-    """表格行数：跳过表头、分隔线、小标题、空行。命令报错 → 返回 None。"""
+    """表格行数：跳过表头、分隔线、小标题、空行。"""
     if not text:
         return 0
-    if "Traceback (most recent call last)" in text or "No module named" in text:
-        return None
     n = 0
     for line in text.splitlines():
         s = line.strip()
@@ -64,18 +63,14 @@ def status():
         return m.group(1).strip() if m else default
 
     unlock = pick(r"解锁方式:\s*(.+)")
-    master = pick(r"主密码态:\s*(.+)", "")
-    if not master or master == "?":
-        master = pick(r"主密码:\s*(.+)")
+    master = pick(r"主密码态:\s*(.+)")
     n_cred = count_rows(creds)
     n_sess = count_rows(sess)
 
     expiries = re.findall(r"(\d{4}-\d{2}-\d{2}) \d{2}:\d{2}:\d{2}\s+有效期内", sess)
     soon = min(expiries) if expiries else "无"
 
-    if "无法校验" in audit:
-        chain = "? 无法校验（日志缺失或为空）"
-    elif "哈希链完整" in audit:
+    if "哈希链完整" in audit:
         chain = "✓ 完整"
     elif "旧格式" in audit:
         chain = "✓ 完整（含旧格式行）"
@@ -86,22 +81,21 @@ def status():
 
     n_pend = 0 if "没有待批准" in pend else count_rows(pend)
 
-    def num(n, unit="个"):
-        return "读取失败" if n is None else f"{n} {unit}"
-
     lines = [
         "════ dsh-id ════",
         f"  解锁       {unlock}",
         f"  主密码     {master}",
-        f"  凭据       {num(n_cred)}      dsh-id creds list",
-        f"  会话       {num(n_sess)}      最近过期 {soon if n_sess is not None else '?'}",
+        f"  凭据       {n_cred} 个      dsh-id creds list",
+        f"  会话       {n_sess} 个      最近过期 {soon}",
         f"  审计链     {chain}",
-        f"  待审批     {num(n_pend,'件')}" + ("      dsh-id guard pending" if n_pend else ""),
+        f"  待审批     {n_pend} 件" + ("      dsh-id guard pending" if n_pend else ""),
         "",
         "  creds   凭据增删查测 / panic / restore / 审计校验",
         "  session 网页会话 存·用·查·删",
         "  exec    按需注入凭据发一次请求",
         "  guard   不可逆操作审批",
+        "  panel   本机面板（127.0.0.1:8791）",
+
     ]
     print("\n".join(lines))
 
