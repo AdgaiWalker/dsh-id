@@ -168,6 +168,14 @@ dsh-id panel --port 9000
 一页看完：凭据（名字/类型/白名单）、会话（域名/保存/有效期）、审计链状态、待审批、隔离目录。
 能改：新增凭据、改白名单、删凭据、删会话、探会话、生成待吊销清单。
 
+常驻方式（推荐，登录即起、只绑本机）：
+
+```bash
+cp cli/systemd/dsh-id-panel.service ~/.config/systemd/user/
+systemctl --user daemon-reload && systemctl --user enable --now dsh-id-panel
+systemctl --user status dsh-id-panel --no-pager
+```
+
 只绑 `127.0.0.1`；写操作要求自定义头 + Origin 校验（挡浏览器跨站请求）；**页面永远不显示凭据值**，
 新增时值只经一次 POST 交给 `vault-cred`（走 stdin），不落盘、不回显、不进日志。
 

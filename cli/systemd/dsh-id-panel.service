@@ -1,0 +1,18 @@
+[Unit]
+Description=dsh-id 账号面板（仅 127.0.0.1:8791）
+Documentation=https://github.com/AdgaiWalker/dsh-id
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=dsh-id panel --port 8791
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.deepseekbot/vault
+PrivateTmp=yes
+
+[Install]
+WantedBy=default.target
