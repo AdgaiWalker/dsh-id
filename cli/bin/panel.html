@@ -131,6 +131,7 @@ async function load() {
     leaseCell(c),
     `<div class="row-actions">
        <button onclick="rotate('${esc(c.name)}')">轮换</button>
+       <button onclick="setLease('${esc(c.name)}', ${c.lease || 0})">设租约</button>
        <button onclick="editDomains('${esc(c.name)}','${esc(c.domains.join(","))}')">改白名单</button>
        <button class="danger" onclick="rmCred('${esc(c.name)}')">删除</button>
      </div>`
@@ -159,6 +160,11 @@ async function rotate(name) {
   const v = prompt(`给 ${name} 输入新的凭据值（只在这一次提交，不回显、不保存明文）`);
   if (!v) return;
   await post({op: "cred_rotate", name, secret: v});
+}
+async function setLease(name, cur) {
+  const v = prompt(`给 ${name} 设租约天数（0 = 不设，从今天重新计时）`, cur || 90);
+  if (v === null) return;
+  await post({op: "cred_lease", name, days: parseInt(v, 10) || 0});
 }
 function editDomains(name, cur) {
   const v = prompt(`改 ${name} 的域名白名单（逗号分隔）`, cur);

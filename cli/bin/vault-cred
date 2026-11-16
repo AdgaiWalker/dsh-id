@@ -124,6 +124,31 @@ def cmd_rotate(args):
     print(f"✓ 已轮换 {name}（租约 {meta.get('lease_days')} 天，从今天重新计）")
 
 
+def cmd_lease(args):
+    """给已有凭据设/改租约（老凭据没有 lease_days 字段）。"""
+    name = args.name
+    try:
+        meta = V.load_meta(name)
+    except V.VaultError:
+        return err(f"凭据不存在: {name}")
+    days = args.days
+    if days is not None:
+        if days < 0:
+            return err("租约天数不能是负数")
+        meta["lease_days"] = days
+    if args.reset:
+        meta["created_at"] = int(__import__("time").time())
+    elif not args.days and "lease_days" not in meta:
+        return err("没有可改的租约；用 --days N 指定（0=取消租约）")
+    V.save_meta(meta)
+    state, left = V.lease_state(meta)
+    tail = (f"剩 {left} 天" if state == "ok" else
+            f"已过期 {abs(left)} 天" if state == "expired" else "无租约")
+    V.audit_event(action="lease_set", cred=name, host="-", path="-", status=0,
+                  note=f"lease_days={meta.get('lease_days')} reset={args.reset}")
+    print(f"✓ {name}: 租约 {meta.get('lease_days')} 天（{tail}）")
+
+
 def cmd_list(args):
     creds = V.list_credentials()
     if not creds:
@@ -840,6 +865,12 @@ def main():
     p_rl = sub.add_parser("revoke-list", help="生成待吊销清单：哪些 token/会话在平台上还没停")
     p_rl.add_argument("--out", help="输出路径，默认 <vault>/REVOKE.md")
     p_rl.set_defaults(func=cmd_revoke_list)
+
+    p_ls = sub.add_parser("lease", help="给已有凭据设/改租约（不换值）")
+    p_ls.add_argument("name")
+    p_ls.add_argument("--days", type=int, help="租约天数，0=取消租约")
+    p_ls.add_argument("--reset", action="store_true", help="从今天重新计时")
+    p_ls.set_defaults(func=cmd_lease)
 
     p_rot = sub.add_parser("rotate", help="轮换凭据值（身份/白名单不变，租约重新计时）")
     p_rot.add_argument("name")

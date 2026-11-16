@@ -167,6 +167,8 @@ dsh-id creds add github-pat bearer --domains api.github.com --lease-days 30
 dsh-id creds add locked-key  bearer --domains api.x.com    --lease-days 0   # 0=不设租约
 dsh-id creds list                       # 多一列：剩 N 天 / 已过期 N 天 / 无租约
 dsh-id creds rotate github-pat          # 只换值，类型/白名单不变，租约重新计时
+dsh-id creds lease github-pat --days 30 --reset   # 给已有凭据补设租约（不换值）
+dsh-id creds lease github-pat --days 0            # 取消租约
 ```
 
 过期了不会静默失败：
