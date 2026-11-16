@@ -23,6 +23,5 @@
     - id: tool-account-vault
       name: dsh-id
       config:
-        vaultDir: ""
-        accountsFile: ""
+        # 同 dsh-account-vault：空串会被 pick() 当作有效值覆盖默认路径，故不写这两项。
         probeUrl: ""
