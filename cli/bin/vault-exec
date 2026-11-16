@@ -40,6 +40,7 @@ AI/shell 一样能拿到。所以取消常驻监听，改成"要用时才解密�
     4    host 不在白名单
     5    解密失败（vault 锁定/密钥不对）
     6    凭据类型不支持
+    8    凭据租约到期（先 vault-cred rotate <名字>）
     22   HTTP >= 400（curl --fail-with-body 的约定），正文仍会输出
     其余 透传被包装命令的退出码
 
@@ -64,6 +65,7 @@ sys.path.insert(0, os.path.expanduser("~/.local/lib"))
 import vaultlib as V  # noqa: E402
 
 EXIT_OK = 0
+EXIT_EXPIRED = 8
 EXIT_USAGE = 2
 EXIT_NO_CRED = 3
 EXIT_HOST_DENIED = 4
@@ -160,6 +162,14 @@ def _load(cred):
     except V.VaultError:
         sys.stderr.write(f"vault-exec: 凭据不存在: {cred}\n")
         raise SystemExit(EXIT_NO_CRED)
+    _lease, _left = V.lease_state(meta)
+    if _lease == "expired":
+        sys.stderr.write(
+            f"vault-exec: 凭据已过期（租约 {meta.get('lease_days')} 天，"
+            f"超期 {_left} 天）——先轮换: vault-cred rotate {cred}\n")
+        audit("exec_lease_expired", cred, note=f"overdue={_left}d")
+        raise SystemExit(EXIT_EXPIRED)
+
     try:
         secret = V.load_secret(cred)
     except V.VaultError as e:

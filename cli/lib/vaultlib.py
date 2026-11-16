@@ -880,6 +880,30 @@ def meta_exists(name) -> bool:
     return os.path.exists(_meta_path(name))
 
 
+LEASE_DEFAULT_DAYS = 90
+
+
+def lease_expiry(meta):
+    """租约到期时间戳；没设租约返回 None（老凭据不受影响）。"""
+    days = meta.get("lease_days")
+    if not days:
+        return None
+    try:
+        return int(meta.get("created_at") or 0) + int(days) * 86400
+    except (TypeError, ValueError):
+        return None
+
+
+def lease_state(meta, now_ts=None):
+    """(state, days_left)；state ∈ ok / expired / none。"""
+    exp = lease_expiry(meta)
+    if exp is None:
+        return "none", None
+    now_ts = int(now_ts if now_ts is not None else __import__("time").time())
+    left = (exp - now_ts) // 86400
+    return ("expired", -(-(exp - now_ts) // 86400)) if now_ts >= exp else ("ok", left)
+
+
 def load_meta(name):
     """只读明文元数据（不解密）。不存在 → unknown_credential。"""
     if not CREDNAME_RE.match(name or ""):

@@ -68,6 +68,7 @@ def cmd_add(args):
         "type": ctype,
         "domains": domains,
         "created_at": int(__import__("time").time()),
+        "lease_days": getattr(args, "lease_days", V.LEASE_DEFAULT_DAYS),
     }
     if ctype == "header":
         if not args.header_name:
@@ -101,16 +102,45 @@ def cmd_add(args):
     print(f"  用法（常驻代理，需先自行启动 vault-proxy）: curl {PROXY}/{name}/<host>/<path>")
 
 
+def cmd_rotate(args):
+    """只换值，不换身份：类型/白名单/租约都保留，created_at 重置。"""
+    name = args.name
+    try:
+        meta = V.load_meta(name)
+    except V.VaultError:
+        return err(f"凭据不存在: {name}（新增用 vault-cred add）")
+    hint = "输入新凭据值（不回显）: " if meta.get("type") != "basic" else "输入 user:pass（不回显）: "
+    value = _read_secret(hint)
+    if not value:
+        return err("值为空，未轮换")
+    V.save_secret(name, value)
+    meta["created_at"] = int(__import__("time").time())
+    meta["rotated_at"] = meta["created_at"]
+    if getattr(args, "lease_days", None) is not None:
+        meta["lease_days"] = args.lease_days
+    V.save_meta(meta)
+    V.audit_event(action="rotate", cred=name, host="-", path="-", status=0,
+                  note=f"lease={meta.get('lease_days')}")
+    print(f"✓ 已轮换 {name}（租约 {meta.get('lease_days')} 天，从今天重新计）")
+
+
 def cmd_list(args):
     creds = V.list_credentials()
     if not creds:
         print("（无凭据）")
         return
-    print(f"{'名字':<22}{'类型':<10}{'域名白名单'}")
-    print("-" * 68)
+    print(f"{'名字':<22}{'类型':<10}{'域名白名单':<34}{'租约'}")
+    print("-" * 78)
     for c in creds:
         domains = ", ".join(c.get("domains") or []) or "（空 · 全部拒绝）"
-        print(f"{c.get('name', '?'):<22}{c.get('type', '?'):<10}{domains}")
+        state, left = V.lease_state(c)
+        if state == "ok":
+            tail = f"剩 {left} 天"
+        elif state == "expired":
+            tail = f"已过期 {abs(left)} 天"
+        else:
+            tail = "无租约"
+        print(f"{c.get('name', '?'):<22}{c.get('type', '?'):<10}{domains:<34}{tail}")
 
 
 def cmd_rm(args):
@@ -770,6 +800,8 @@ def main():
     p_add.add_argument("--param-name", dest="param_name",
                        help="query 类型要拼的查询参数名")
     p_add.add_argument("--force", action="store_true", help="覆盖已存在的凭据")
+    p_add.add_argument("--lease-days", type=int, default=V.LEASE_DEFAULT_DAYS,
+                       help=f"租约天数：到期后拒绝使用，必须先轮换（默认 {V.LEASE_DEFAULT_DAYS}，0=不设租约）")
     p_add.set_defaults(func=cmd_add)
 
     p_list = sub.add_parser("list", help="列出凭据（只显示名字/类型/域名）")
@@ -808,6 +840,11 @@ def main():
     p_rl = sub.add_parser("revoke-list", help="生成待吊销清单：哪些 token/会话在平台上还没停")
     p_rl.add_argument("--out", help="输出路径，默认 <vault>/REVOKE.md")
     p_rl.set_defaults(func=cmd_revoke_list)
+
+    p_rot = sub.add_parser("rotate", help="轮换凭据值（身份/白名单不变，租约重新计时）")
+    p_rot.add_argument("name")
+    p_rot.add_argument("--lease-days", type=int, help="顺便改租约天数")
+    p_rot.set_defaults(func=cmd_rotate)
 
     p_verify = sub.add_parser("audit-verify", help="校验审计日志哈希链完整性")
     p_verify.add_argument("--file", help="指定审计文件（默认 ~/.deepseekbot/vault/audit.log）")

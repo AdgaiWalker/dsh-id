@@ -34,7 +34,7 @@ dsh-id exec github-pat https://api.github.com/user
 | --- | --- |
 | `dsh-id exec` | 按需注入凭据，发一次 HTTP 请求或跑一条命令，结束即失效 |
 | `dsh-id session` | 网页登录态：**登录一次**存下 cookie/localStorage，之后直接是登录态（2FA 只过一次） |
-| `dsh-id creds` | 凭据增删查测、改主密码、`panic` 一键吊销、`restore` 恢复、审计链校验 |
+| `dsh-id creds` | 凭据增删查测、换值（轮换）、租约到期拦截、`panic` / `restore`、审计链校验 |
 | `dsh-id guard` | 不可逆操作闸门：删除/转账/发布这类动作先记一条待批准 |
 | `dsh-id panel` | 本机网页面板（127.0.0.1:8791）：看账号/会话/审计，增删改凭据 |
 | `dsh-id` | 不带参数：一屏状态（凭据数、会话数、审计链、待审批） |
@@ -157,6 +157,27 @@ dsh-id panel --port 9000
 
 只绑 `127.0.0.1`；写操作要求自定义头 + Origin 校验（挡浏览器跨站请求）；**页面永远不显示凭据值**，
 新增时值只经一次 POST 交给 `vault-cred`（走 stdin），不落盘、不回显、不进日志。
+
+### 租约：到期自动失效（对标 Vault 的短时凭据）
+
+凭据不是永久有效的——默认 90 天租约，过期后 `exec` 直接拒绝（退出码 8），逼着轮换：
+
+```bash
+dsh-id creds add github-pat bearer --domains api.github.com --lease-days 30
+dsh-id creds add locked-key  bearer --domains api.x.com    --lease-days 0   # 0=不设租约
+dsh-id creds list                       # 多一列：剩 N 天 / 已过期 N 天 / 无租约
+dsh-id creds rotate github-pat          # 只换值，类型/白名单不变，租约重新计时
+```
+
+过期了不会静默失败：
+
+```text
+$ dsh-id exec github-pat https://api.github.com/user
+vault-exec: 凭据已过期（租约 90 天，超期 10 天）——先轮换: vault-cred rotate github-pat
+exit=8
+```
+
+现有凭据没有租约字段，行为不变（列表显示「无租约」），不会被追溯设成过期。
 
 ### 账目与审计
 

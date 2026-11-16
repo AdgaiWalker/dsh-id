@@ -43,11 +43,15 @@ def _norm_domains(v):
 def state():
     creds = []
     for m in V.list_credentials():
+        lstate, left = V.lease_state(m)
         creds.append({
             "name": m.get("name", "?"),
             "type": m.get("type", "?"),
             "domains": _norm_domains(m.get("domains")),
             "created": m.get("created_at", ""),
+            "lease": m.get("lease_days", 0),
+            "lease_state": lstate,
+            "days_left": left,
         })
     sessions = []
     for s in V.list_sessions():
@@ -104,6 +108,16 @@ def action(op, body):
         V.audit_event(action="panel_cred_add", cred=name, host=domains.split(",")[0],
                       path="-", status=0, note="via dsh-id panel")
         return True, f"已新增 {name}"
+
+    if op == "cred_rotate":
+        name = str(body.get("name", "")).strip()
+        secret = str(body.get("secret", ""))
+        if not name or not secret:
+            return False, "名字和新值都要填"
+        rc, out = _run("vault-cred", "rotate", name, stdin_data=secret + "\n")
+        if rc != 0:
+            return False, (out.strip().splitlines()[-1] if out.strip() else "轮换失败")
+        return True, f"已轮换 {name}"
 
     if op == "cred_rm":
         name = str(body.get("name", "")).strip()

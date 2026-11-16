@@ -37,6 +37,7 @@
   @media (max-width:520px){
     form.add{grid-template-columns:1fr}
     th:nth-child(4),td:nth-child(4){display:none}
+    th:nth-child(3),td:nth-child(3){display:none}
   }
 </style>
 </head>
@@ -120,11 +121,16 @@ async function load() {
   $("#vault").textContent = s.vault;
   $("#credCount").textContent = s.creds.length + " 个";
   $("#sessCount").textContent = s.sessions.length + " 个";
-  $("#creds").innerHTML = table(["名字", "类型", "白名单", "操作"], s.creds.map(c => [
+  const leaseCell = (c) => c.lease_state === "none" ? '<span class="domains">无租约</span>'
+    : c.lease_state === "expired" ? `<span class="bad">已过期 ${Math.abs(c.days_left)} 天</span>`
+    : `<span class="ok">剩 ${c.days_left} 天</span>`;
+  $("#creds").innerHTML = table(["名字", "类型", "白名单", "租约", "操作"], s.creds.map(c => [
     `<span class="mono">${esc(c.name)}</span>`,
     esc(c.type),
     `<span class="domains mono">${esc(c.domains.join(", "))}</span>`,
+    leaseCell(c),
     `<div class="row-actions">
+       <button onclick="rotate('${esc(c.name)}')">轮换</button>
        <button onclick="editDomains('${esc(c.name)}','${esc(c.domains.join(","))}')">改白名单</button>
        <button class="danger" onclick="rmCred('${esc(c.name)}')">删除</button>
      </div>`
@@ -148,6 +154,11 @@ async function load() {
   $("#pending").textContent = s.pending ? s.pending + " 件待批准" : "没有待批准的操作";
   $("#quar").textContent = s.quarantines.length ? s.quarantines.join(", ") : "无隔离中的密文";
   window.__types = s.types;
+}
+async function rotate(name) {
+  const v = prompt(`给 ${name} 输入新的凭据值（只在这一次提交，不回显、不保存明文）`);
+  if (!v) return;
+  await post({op: "cred_rotate", name, secret: v});
 }
 function editDomains(name, cur) {
   const v = prompt(`改 ${name} 的域名白名单（逗号分隔）`, cur);
