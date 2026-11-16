@@ -25,6 +25,7 @@ TARGETS = {
     "exec": "vault-exec",
     "guard": "vault-guard",
     "panel": "dsh-id-panel",
+    "login": "vault-login",
 }
 ALIASES = {"cred": "creds", "credo": "creds", "sessions": "session", "sess": "session"}
 
@@ -99,6 +100,8 @@ def status():
         "  exec    按需注入凭据发一次请求",
         "  guard   不可逆操作审批",
         "  panel   本机面板（127.0.0.1:8791）",
+        "  login   自动登录并保存会话",
+
         "  doctor  自检并生成可粘贴的诊断报告",
 
     ]

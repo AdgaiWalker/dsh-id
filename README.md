@@ -109,6 +109,23 @@ dsh-id exec run github-pat -- sh -c 'curl -H "Authorization: Bearer $VAULT_SECRE
 
 域名不在该凭据的白名单里 → 直接拒绝，退出码 4。
 
+### 让 AI 自己登录（账号密码 + 2FA）
+
+```bash
+dsh-id login github --url https://github.com/login \
+  --cred github-login --totp github-totp        # 有 COOKIE 就打，无则人工接手
+
+# 凭据怎么存：
+dsh-id creds add github-login basic  --domains github.com     # 值填 user:pass
+dsh-id creds add github-totp  bearer --domains github.com --lease-days 0   # 值填 base32 种子
+```
+
+流程：打开登录页 → 填账号密码 → 提交 → 认出 2FA 框就用 TOTP 算码填入 → 启发式确认已登录 →
+自动 `storage_state` 加密存成会话（`vault-session use <名字>` 复用）。每步截图落
+`~/.deepseekbot/vault/shots/`，失败时看截图定位。
+
+没有 TOTP 种子时加 `--manual-2fa`：窗口留给你手工过验证码，脚本等你。
+
 ### 存一个网页登录态
 
 ```bash

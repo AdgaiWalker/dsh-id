@@ -10,7 +10,7 @@ VAULT="${HOME}/.deepseekbot/vault"
 mkdir -p "$BIN" "$LIB" "$VAULT"
 chmod 700 "$VAULT"
 
-for f in dsh-id dsh-id-panel vault-cred vault-session vault-guard vault-exec vault-proxy accounts; do
+for f in dsh-id dsh-id-panel vault-login vault-cred vault-session vault-guard vault-exec vault-proxy accounts; do
   install -m 755 "$SRC/cli/bin/$f" "$BIN/$f"
 done
 install -m 644 "$SRC/cli/bin/panel.html" "$BIN/panel.html"
