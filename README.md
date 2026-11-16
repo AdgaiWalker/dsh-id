@@ -203,6 +203,22 @@ dsh-id guard check "删除生产库" # → require_approval / allow
 
 ---
 
+## 维护通道（哪里错了能改）
+
+| 通道 | 怎么用 |
+| --- | --- |
+| 自检 | `dsh-id doctor` / `dsh-id doctor --json`（把输出贴进 issue 即可，无凭据值） |
+| 版本 | `dsh-id version`；面板顶部显示版本，「检查更新」读 GitHub 最新 release |
+| 运行日志 | `<vault>/logs/dsh-id-YYYY-MM-DD.log`，按天保留 14 天，只记动作/名字/主机/结果 |
+| 反馈 | 面板「报告问题」一键生成脱敏 issue，或直接开 [Issue](https://github.com/AdgaiWalker/dsh-id/issues/new/choose) |
+| 仓库 | 面板「仓库」「文档」直达；`CHANGELOG.md` 记每次改了什么 |
+
+日志长这样（不含 URL，不含值）：
+
+```json
+{"ts":"2026-11-16T18:10:06","action":"panel_check_update","ok":true,"msg":"已是最新 0.1.0"}
+```
+
 ## 安全模型：它挡什么，挡不住什么
 
 **设计上做到的**
