@@ -82,4 +82,44 @@ vault-guard reset --scope B >/dev/null
 vault-guard check "发一条帖子" --scope B >/dev/null && echo "   ✓ reset 后恢复" || { echo "   ✗ reset 无效"; exit 1; }
 
 echo
+echo "9) 老格式归档（账实一致）"
+unset VAULT_DIR_OVERRIDE
+python3 - "$HOME" <<'PY'
+import os, sys
+home = sys.argv[1]
+sys.path.insert(0, os.path.join(home, ".local", "lib"))
+import vaultlib as V
+V.ensure_key(); V.init_machine_binding()
+open(os.path.join(V._vault_dir(), "probe__totp.enc"), "wb").write(V.encrypt("JBSWY3DPEHPK3PXP"))
+PY
+vault-cred adopt >/dev/null
+vault-cred list | grep -q "probe" && echo "   ✓ 归档后进索引" || { echo "   ✗ 归档后仍不可见"; exit 1; }
+set +e; vault-exec curl probe https://example.com/x >/dev/null 2>&1; c=$?; set -e
+[ "$c" = "6" ] && echo "   ✓ totp 不能 exec → exit 6" || { echo "   ✗ totp 竟然能 exec exit=$c"; exit 1; }
+
+echo
+echo "10) 作用域（方法 + 路径）"
+vault-cred scope testcred --methods GET --paths /probe >/dev/null
+set +e; vault-exec curl testcred "http://127.0.0.1:$PORT/probe" -X DELETE >/dev/null 2>&1; c=$?; set -e
+[ "$c" = "9" ] && echo "   ✓ DELETE 被作用域拒绝 → exit 9" || { echo "   ✗ 作用域没拦住 exit=$c"; exit 1; }
+vault-exec curl testcred "http://127.0.0.1:$PORT/probe" >/dev/null && echo "   ✓ 允许的 GET 照常" || { echo "   ✗ 误拦了 GET"; exit 1; }
+
+echo
+echo "11) 机外锚（可核对）"
+ANCHOR="$T/anchor.json"
+vault-cred audit-anchor --out "$ANCHOR" >/dev/null
+vault-cred audit-verify --anchor "$ANCHOR" >/dev/null && echo "   ✓ 锚与链一致" || { echo "   ✗ 锚校验失败"; exit 1; }
+python3 - "$HOME" <<'PY'
+import json, os, sys
+home = sys.argv[1]
+p = os.path.join(home, ".deepseekbot", "vault", "audit.log")
+lines = open(p).read().splitlines()
+rec = json.loads(lines[0]); rec["status"] = 999
+lines[0] = json.dumps(rec, ensure_ascii=False, separators=(",", ":"))
+open(p, "w").write("\n".join(lines) + "\n")
+PY
+set +e; out="$(vault-cred audit-verify --anchor "$ANCHOR" 2>&1)"; c=$?; set -e
+[ "$c" = "1" ] && echo "   ✓ 改一行后锚报不一致 → exit 1" || { echo "   ✗ 改了还报一致: $out"; exit 1; }
+
+echo
 echo "全部通过"

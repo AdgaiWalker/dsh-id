@@ -66,16 +66,21 @@ def cmd_add(args):
         sys.exit("类型必须是: " + ", ".join(V.SUPPORTED_TYPES))
 
     domains = [d.strip().lower() for d in (args.domains or "").split(",") if d.strip()]
-    if not domains:
+    if not domains and ctype not in V.NO_EXEC_TYPES:
         sys.exit("必须给 --domains（默认拒绝，白名单不能为空）")
+    if ctype in V.NO_EXEC_TYPES:
+        domains = []       # totp 不发网络请求，白名单无意义
 
     meta = {
         "name": name,
         "type": ctype,
         "domains": domains,
         "created_at": int(__import__("time").time()),
-        "lease_days": getattr(args, "lease_days", V.LEASE_DEFAULT_DAYS),
     }
+    if ctype in V.NO_LEASE_TYPES:
+        meta["lease_days"] = 0        # 种子不过期
+    else:
+        meta["lease_days"] = getattr(args, "lease_days", V.LEASE_DEFAULT_DAYS)
     if ctype == "header":
         if not args.header_name:
             sys.exit("header 类型必须给 --header-name")
@@ -104,8 +109,13 @@ def cmd_add(args):
         print(f"  注入头: {meta['header_name']}")
     if ctype == "query":
         print(f"  查询参数: {meta['param_name']}")
-    print(f"  用法（推荐，按需注入）: vault-exec curl {name} https://<host>/<path>")
-    print(f"  用法（常驻代理，需先自行启动 vault-proxy）: curl {PROXY}/{name}/<host>/<path>")
+    if ctype in V.NO_EXEC_TYPES:
+        print("  这一类是第二因素种子：不能 exec、不发网络请求、没有租约")
+        print(f"  用法: vault-login <会话名> --url <登录页> --cred <账号密码凭据> --totp {name}")
+        print("  提醒: 种子与密码同库，安全性不因此提高，提高的是自动化。")
+    else:
+        print(f"  用法（推荐，按需注入）: vault-exec curl {name} https://<host>/<path>")
+        print(f"  给老格式凭据补作用域: vault-cred scope {name} --methods GET,POST --paths /repos/")
 
 
 GITHUB_API = os.environ.get("DSH_ID_GITHUB_API", "https://api.github.com")
@@ -182,6 +192,11 @@ def cmd_rotate(args):
         meta = V.load_meta(name)
     except V.VaultError:
         _die(f"凭据不存在: {name}（新增用 vault-cred add）")
+    if meta.get("type") in V.NO_EXEC_TYPES:
+        print("提醒：这是第二因素种子。换掉它等于更换 2FA，必须同时在平台上重新绑定，")
+        print("      否则这个账号会立刻登不进去。继续请重跑并加 --force。")
+        if not getattr(args, "force", False):
+            sys.exit(10)
     hint = "输入新凭据值（不回显）: " if meta.get("type") != "basic" else "输入 user:pass（不回显）: "
     value = _read_secret(hint)
     if not value:
@@ -195,7 +210,10 @@ def cmd_rotate(args):
     V.audit_event(action="rotate", cred=name, host="-", path="-", status=0,
                   note=f"lease={meta.get('lease_days')}")
     V.app_log("rotate", cred=name)
-    print(f"✓ 已轮换 {name}（租约 {meta.get('lease_days')} 天，从今天重新计）")
+    if meta.get("type") in V.NO_LEASE_TYPES:
+        print(f"✓ 已更换 {name} 的种子（无租约；记得去平台重新绑定）")
+    else:
+        print(f"✓ 已轮换 {name}（租约 {meta.get('lease_days')} 天，从今天重新计）")
 
 
 def cmd_lease(args):
@@ -205,6 +223,9 @@ def cmd_lease(args):
         meta = V.load_meta(name)
     except V.VaultError:
         _die(f"凭据不存在: {name}")
+    if meta.get("type") in V.NO_LEASE_TYPES:
+        _die(f"{name} 是第二因素种子，没有租约；作废一个种子等于锁死账号，"
+             "要换就 rotate（并去平台重新绑定）")
     days = args.days
     if days is not None:
         if days < 0:
@@ -229,18 +250,30 @@ def cmd_list(args):
     if not creds:
         print("（无凭据）")
         return
-    print(f"{'名字':<22}{'类型':<10}{'域名白名单':<34}{'租约'}")
-    print("-" * 78)
+    print(f"{'名字':<22}{'类型':<10}{'域名白名单':<30}{'租约':<12}{'作用域'}")
+    print("-" * 92)
     for c in creds:
-        domains = ", ".join(c.get("domains") or []) or "（空 · 全部拒绝）"
+        ctype = c.get("type", "?")
+        if ctype in V.NO_EXEC_TYPES:
+            domains = "（第二因素 · 不发网络请求）"
+        else:
+            domains = ", ".join(c.get("domains") or []) or "（空 · 全部拒绝）"
         state, left = V.lease_state(c)
-        if state == "ok":
+        if ctype in V.NO_LEASE_TYPES:
+            tail = "无租约"
+        elif state == "ok":
             tail = f"剩 {left} 天"
         elif state == "expired":
             tail = f"已过期 {abs(left)} 天"
         else:
             tail = "无租约"
-        print(f"{c.get('name', '?'):<22}{c.get('type', '?'):<10}{domains:<34}{tail}")
+        sc = V.scope_of(c)
+        scope = "未收紧"
+        if sc["methods"] or sc["paths"]:
+            scope = "%s %s" % (",".join(sc["methods"]) or "*", ",".join(sc["paths"]) or "*")
+        if c.get("legacy_file"):
+            scope += " · 归档"
+        print(f"{c.get('name', '?'):<22}{ctype:<10}{domains:<30}{tail:<12}{scope}")
 
 
 def cmd_rm(args):
@@ -610,6 +643,13 @@ def cmd_revoke(args):
 
 
 def cmd_audit_verify(args):
+    if getattr(args, "anchor", None):
+        status, detail = V.verify_anchor(args.anchor)
+        print(f"锚文件: {args.anchor}")
+        print(("✓ " if status == "ok" else "✗ ") + detail)
+        for line in _anchor_hint(status, detail):
+            print("  " + line)
+        sys.exit(0 if status == "ok" else 1)
     path = args.file or V.AUDIT_LOG
     ok, problems, total, legacy = V.verify_chain(path)
     print(f"审计日志: {path}")
@@ -886,6 +926,68 @@ def cmd_test(args):
         sys.exit(f"连不上代理（服务没起？）: {e.reason}")
 
 
+def _anchor_hint(status, detail):
+    if status == "ok":
+        return ["链条与锚一致；后面新写的行不会影响这条结论。"]
+    if status == "truncated":
+        return ["日志比锚短：有行被删掉了。锚是机外副本，它是准的。"]
+    return ["同样行数但链头不同：历史被重写过。别信这份日志，看锚。"]
+
+
+def cmd_adopt(args):
+    """把老格式裸密文登记进索引（只补元数据，不重新加密）。"""
+    items = V.legacy_files()
+    if not items:
+        print("没有需要归档的老格式密文")
+        return
+    print(f"发现 {len(items)} 个未入索引的老格式密文：")
+    for it in items:
+        print(f"  {it['file']:<28} → 名字 {it['name']:<20} 类型 "
+              f"{V.LEGACY_KIND_TYPE.get(it['kind'], 'bearer')}")
+    results = V.adopt_legacy(dry_run=args.dry_run)
+    if args.dry_run:
+        print("（dry-run，没有写入）")
+        return
+    for name, kind, action in results:
+        print(("✓ 已归档 " if action == "adopted" else "· 已在索引 ") + name)
+    print(f"完成：{sum(1 for _,_,a in results if a == 'adopted')} 个已入索引，密文本字节未改动。")
+
+
+def cmd_scope(args):
+    """给凭据收紧 HTTP 作用域（method + 路径前缀）。"""
+    def _split(v):
+        if v is None:
+            return None
+        return [x.strip() for x in str(v).split(",") if x.strip()]
+    try:
+        meta = V.set_scope(args.name, methods=_split(args.methods), paths=_split(args.paths))
+    except V.VaultError as e:
+        sys.exit(str(e))
+    sc = V.scope_of(meta)
+    V.audit_event(action="scope_set", cred=args.name, host="-", path="-", status=0,
+                  note="methods=%s paths=%s" % (",".join(sc["methods"]) or "*",
+                                                ",".join(sc["paths"]) or "*"))
+    V.app_log("scope", cred=args.name)
+    print(f"✓ {args.name} 作用域：方法 {','.join(sc['methods']) or '*'} · "
+          f"路径前缀 {', '.join(sc['paths']) or '*（全部）'}")
+    if not sc["methods"] and not sc["paths"]:
+        print("  （两边都空 = 不限，等于没收紧）")
+
+
+def cmd_anchor(args):
+    """导出/核对审计链头（机外锚定）。"""
+    if args.check:
+        status, detail = V.verify_anchor(args.check)
+        print(("✓ " if status == "ok" else "✗ ") + detail)
+        sys.exit(0 if status == "ok" else 1)
+    out = args.out or os.path.expanduser("~/.dsh/log/dsh-id-audit-anchor.json")
+    rec = V.audit_anchor(out)
+    print(f"✓ 锚已写出: {out}")
+    print(f"  行数 {rec['rows']} · 链头 {rec['head'][:16]}… · 链状态 "
+          f"{'ok' if rec['chain_ok'] else '异常'}")
+    print("  把这份文件放到机外（密码管理器/另一台机器）；核对：vault-cred audit-verify --anchor <文件>")
+
+
 def main():
     ap = argparse.ArgumentParser(
         prog="vault-cred", description="账号执行层凭据管理")
@@ -894,8 +996,8 @@ def main():
     p_add = sub.add_parser("add", help="新增凭据（交互输入值，不回显）")
     p_add.add_argument("name")
     p_add.add_argument("type", choices=V.SUPPORTED_TYPES)
-    p_add.add_argument("--domains", required=True,
-                       help="域名白名单，逗号分隔；支持 *.example.com")
+    p_add.add_argument("--domains", default="",
+                       help="域名白名单，逗号分隔；支持 *.example.com（totp 不需要）")
     p_add.add_argument("--header-name", dest="header_name",
                        help="header 类型要注入的请求头名")
     p_add.add_argument("--param-name", dest="param_name",
@@ -959,13 +1061,32 @@ def main():
     p_rot = sub.add_parser("rotate", help="轮换凭据值（身份/白名单不变，租约重新计时）")
     p_rot.add_argument("name")
     p_rot.add_argument("--lease-days", type=int, help="顺便改租约天数")
+    p_rot.add_argument("--force", action="store_true", help="totp 换种子要显式确认（等于换 2FA）")
     p_rot.set_defaults(func=cmd_rotate)
 
-    p_verify = sub.add_parser("audit-verify", help="校验审计日志哈希链完整性")
+    p_verify = sub.add_parser("audit-verify", help="校验审计日志哈希链完整性（可对机外锚）")
+    p_verify.add_argument("--anchor", help="机外锚文件；给了就只比锚，不看整条链")
     p_verify.add_argument("--file", help="指定审计文件（默认 ~/.deepseekbot/vault/audit.log）")
     p_verify.set_defaults(func=cmd_audit_verify)
 
     # ── 主密码 / 自动锁定 ──
+    p_adopt = sub.add_parser("adopt", help="把老格式裸密文登记进索引（只补元数据，不重新加密）")
+    p_adopt.add_argument("--dry-run", dest="dry_run", action="store_true", help="只看会做什么")
+    p_adopt.set_defaults(func=cmd_adopt)
+
+    p_scope = sub.add_parser("scope", help="给凭据收紧 HTTP 作用域（方法 + 路径前缀）")
+    p_scope.add_argument("name")
+    p_scope.add_argument("--methods", default=None,
+                         help="允许的方法，逗号分隔，如 GET,POST；给空串表示清空")
+    p_scope.add_argument("--paths", default=None,
+                         help="允许的路径前缀，逗号分隔，如 /repos/,/user")
+    p_scope.set_defaults(func=cmd_scope)
+
+    p_anchor = sub.add_parser("audit-anchor", help="导出审计链头到机外可核对的锚文件")
+    p_anchor.add_argument("--out", help="锚文件路径（默认 vault/audit-anchor.json）")
+    p_anchor.add_argument("--check", help="改为核对已有锚文件")
+    p_anchor.set_defaults(func=cmd_anchor)
+
     p_init = sub.add_parser("init", help="设置主密码（首次）")
     p_init.add_argument("--timeout", type=int, default=None,
                         help="自动锁定超时分钟数（默认 30）")

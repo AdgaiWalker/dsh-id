@@ -36,9 +36,8 @@ import urllib.parse
 sys.path.insert(0, os.path.expanduser("~/.local/lib"))
 import vaultlib as V  # noqa: E402
 
-VENV_PY = os.environ.get("DSH_ID_SESSION_PY") or os.path.expanduser(
-    "~/.local/share/vault-session/venv/bin/python")
-CHROME = os.environ.get("DSH_ID_CHROME") or "/usr/bin/chromium"
+VENV_PY = "/home/happy/.local/share/vault-session/venv/bin/python"
+CHROME = "/usr/bin/chromium"
 
 # 登录页/登录墙的常见特征，用于 check 判断是否被踢回登录
 LOGIN_HINTS = (
@@ -253,8 +252,34 @@ def cmd_use(args):
         sys.exit(f"✗ {e}")
 
     if V.session_expired(meta) and not args.force:
-        sys.exit(f"✗ 会话 {name} 已过期（{meta['expires_at_str']}）。"
-                 f"请重新 save，或加 --force 强行尝试。")
+        prof = V.load_login_profile(name)
+        if prof and not getattr(args, "no_relogin", False):
+            # 会话短期化（默认 7 天）的前提：过期能自己重建
+            print(f"会话已过期（{meta['expires_at_str']}），用登录档案自动重登…")
+            cmd = ["vault-login", name, "--url", prof["url"], "--cred", prof["cred"],
+                   "--method", prof.get("method") or "manual",
+                   "--ttl-days", str(prof.get("ttl_days") or V.SESSION_TTL_DEFAULT)]
+            if prof.get("totp"):
+                cmd += ["--totp", prof["totp"]]
+            if prof.get("headless"):
+                cmd += ["--headless"]
+            for k, flag in (("user_selector", "--user-selector"),
+                            ("pass_selector", "--pass-selector"),
+                            ("submit_selector", "--submit-selector"),
+                            ("otp_selector", "--otp-selector")):
+                if prof.get(k):
+                    cmd += [flag, prof[k]]
+            import subprocess as _sp
+            rc = _sp.run(cmd).returncode
+            if rc != 0:
+                sys.exit(f"✗ 自动重登失败（exit {rc}）。看 vault-login 输出的截图定位。")
+            meta = V.load_session_meta(name)
+            state_json = V.load_session_state(name)
+        else:
+            hint = ("这个会话没有登录档案，只能人工重登"
+                    if not prof else "加了 --no-relogin")
+            sys.exit(f"✗ 会话 {name} 已过期（{meta['expires_at_str']}）；{hint}。"
+                     f"请重新 save，或加 --force 强行尝试。")
 
     state = json.loads(state_json)
     state_json = None
@@ -444,13 +469,15 @@ def main():
     p_save = sub.add_parser("save", help="开可见浏览器，手动登录后保存会话")
     p_save.add_argument("name")
     p_save.add_argument("--url", required=True, help="登录页 URL")
-    p_save.add_argument("--ttl-days", type=float, default=30,
-                        help="有效期天数（默认 30）")
+    p_save.add_argument("--ttl-days", type=float, default=V.SESSION_TTL_DEFAULT,
+                        help="有效期天数（默认 %d）" % V.SESSION_TTL_DEFAULT)
     p_save.set_defaults(func=cmd_save)
 
     p_use = sub.add_parser("use", help="恢复会话并打开浏览器")
     p_use.add_argument("name")
     p_use.add_argument("--headless", action="store_true", help="无头模式")
+    p_use.add_argument("--no-relogin", dest="no_relogin", action="store_true",
+                       help="过期也不自动重登，直接报错")
     p_use.add_argument("--open", help="恢复后打开哪个 URL（默认该站首页）")
     p_use.add_argument("--screenshot", help="打开后截图保存到该路径")
     p_use.add_argument("--hold", action="store_true", help="保持浏览器打开直到回车")

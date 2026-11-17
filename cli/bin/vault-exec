@@ -71,6 +71,7 @@ EXIT_NO_CRED = 3
 EXIT_HOST_DENIED = 4
 EXIT_DECRYPT = 5
 EXIT_BAD_TYPE = 6
+EXIT_SCOPE_DENIED = 9
 
 
 def audit(action, cred, note="", host="-", path="-", status=0):
@@ -162,6 +163,12 @@ def _load(cred):
     except V.VaultError:
         sys.stderr.write(f"vault-exec: 凭据不存在: {cred}\n")
         raise SystemExit(EXIT_NO_CRED)
+    if meta.get("type") in V.NO_EXEC_TYPES:
+        sys.stderr.write(
+            f"vault-exec: {cred} 是第二因素种子（totp），不能注入 HTTP。\n"
+            "  要算码用 vault-login / totp；把种子当 Bearer 发出去等于把它泄露。\n")
+        audit("exec_refused_totp", cred, note="totp_not_executable")
+        raise SystemExit(EXIT_BAD_TYPE)
     _lease, _left = V.lease_state(meta)
     if _lease == "expired":
         sys.stderr.write(
@@ -269,6 +276,19 @@ def cmd_curl(argv):
         sys.stderr.write(f"vault-exec: 拒绝 —— {host} 不在 {cred} 的 domains 白名单内\n")
         audit("exec_host_denied", cred, host=host, note="host_not_allowed")
         return EXIT_HOST_DENIED
+
+    # 作用域校验：域名只说「能发给谁」，这里说「能对它做什么」（v0.2.0 · M1）
+    method = _method_of(extra)
+    path = urllib.parse.urlparse(url).path or "/"
+    allowed, why = V.scope_allows(meta, method, path)
+    if not allowed:
+        secret = None
+        sys.stderr.write(f"vault-exec: 拒绝 —— {why}\n")
+        sys.stderr.write(f"  要给 {cred} 开这个口子: vault-cred scope {cred} "
+                         f"--methods {method} --paths {path.rsplit('/', 1)[0] or '/'}/\n")
+        audit("exec_scope_denied", cred, host=host, path=path, status=0,
+              note=f"{method} {why}")
+        return EXIT_SCOPE_DENIED
 
     # 构造 curl 参数：凭据只走 stdin 配置文件（不进 argv）
     # 用 curl 的 -K - （从 stdin 读配置）避免值出现在 ps

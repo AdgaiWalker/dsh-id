@@ -1,6 +1,6 @@
 {
   "name": "dsh-id",
-  "version": "0.1.2",
+  "version": "0.2.0",
   "description": "DSH bundle：给 AI Agent 的账号执行层——凭据按需注入、登录态复用、不可逆操作闸门、哈希链审计。工具不返回凭据值。",
   "type": "module",
   "main": "lib/index.js",

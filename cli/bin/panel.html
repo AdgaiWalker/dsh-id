@@ -37,8 +37,14 @@
   #toast.show{opacity:.95}
   @media (max-width:520px){
     form.add{grid-template-columns:1fr}
-    th:nth-child(2),td:nth-child(2),th:nth-child(3),td:nth-child(3),th:nth-child(4),td:nth-child(4){display:none}
+    table,tbody,tr,td{display:block;width:auto}
+    thead{display:none}
+    tr{padding:10px 12px;border-bottom:1px solid var(--line)}
+    td{border:0;padding:2px 0}
+    td[data-label]:not(:first-child)::before{content:attr(data-label);display:block;font-size:11px;color:var(--ink2);margin-top:4px}
+    td.dup{display:none}
     .subline{display:block}
+    .row-actions{margin-top:8px}
   }
 </style>
 </head>
@@ -65,6 +71,7 @@
         <option value="basic">basic（用户名:密码）</option>
         <option value="header">header（自定义头）</option>
         <option value="query">query（拼查询参数）</option>
+        <option value="totp">totp（第二因素种子 · 不能 exec · 无租约）</option>
       </select>
       <input name="domains" class="full" placeholder="域名白名单，逗号分隔，如 api.github.com,*.example.com" required>
       <input name="header_name" placeholder="header 类型的请求头名（可选）">
@@ -72,6 +79,12 @@
       <input name="secret" class="full" type="password" placeholder="凭据值（只提交一次，不回显）" autocomplete="new-password" required>
       <div class="full row-actions"><button class="primary" type="submit">新增凭据</button></div>
     </form>
+  </section>
+
+  <section>
+    <h2>第二因素 <span class="count" id="facCount"></span></h2>
+    <div id="factors"></div>
+    <div class="hint">种子永不回显、不能注入 HTTP、没有租约。它和密码同库，安全性不因此提高，提高的是自动化。</div>
   </section>
 
   <section>
@@ -90,9 +103,12 @@
     <table>
       <tr><th style="width:120px">审计链</th><td id="audit">…</td></tr>
       <tr><th>待审批</th><td id="pending">…</td></tr>
+      <tr><th>机外锚</th><td id="anchor">…</td></tr>
       <tr><th>隔离目录</th><td id="quar">…</td></tr>
     </table>
     <div class="hint row-actions" style="padding:12px 14px">
+      <button id="btnAdopt">归档老格式密文</button>
+      <button id="btnAnchor">导出机外锚</button>
       <button id="btnRevoke">生成待吊销清单</button>
       <button id="btnVerify">重新校验审计链</button>
     </div>
@@ -113,7 +129,7 @@ function toast(msg, bad) {
   toastTimer = setTimeout(() => t.classList.remove("show"), 2600);
 }
 async function post(body) {
-  const r = await fetch("/api/action", {method: "POST", headers: H, body: JSON.stringify(body)});
+  const r = await fetch("./api/action", {method: "POST", headers: H, body: JSON.stringify(body)});
   const j = await r.json().catch(() => ({ok: false, message: "响应不是 JSON"}));
   toast(j.message || (j.ok ? "完成" : "失败"), !j.ok);
   if (j.ok) load();
@@ -122,14 +138,18 @@ async function post(body) {
 function table(headers, rows) {
   if (!rows.length) return '<div class="hint">还没有。</div>';
   const th = headers.map(h => `<th>${h}</th>`).join("");
-  const tr = rows.map(cells => `<tr>${cells.map(c => `<td>${c}</td>`).join("")}</tr>`).join("");
+  const tr = rows.map(cells => "<tr>" + cells.map((c, i) => {
+    const o = (c && typeof c === "object") ? c : {html: c};
+    const cls = o.cls ? ` class="${o.cls}"` : "";
+    return `<td data-label="${esc(headers[i] || "")}"${cls}>${o.html}</td>`;
+  }).join("") + "</tr>").join("");
   return `<table><thead><tr>${th}</tr></thead><tbody>${tr}</tbody></table>`;
 }
 function pill(ok) {
   return ok ? '<span class="pill ok">有效期内</span>' : '<span class="pill bad">已过期</span>';
 }
 async function load() {
-  const r = await fetch("/api/state");
+  const r = await fetch("./api/state");
   const s = await r.json();
   $("#vault").textContent = s.vault;
   $("#ver").textContent = "v" + s.version;
@@ -145,23 +165,53 @@ async function load() {
   const leaseCell = (c) => c.lease_state === "none" ? '<span class="domains">无租约</span>'
     : c.lease_state === "expired" ? `<span class="bad">已过期 ${Math.abs(c.days_left)} 天</span>`
     : `<span class="ok">剩 ${c.days_left} 天</span>`;
-  $("#creds").innerHTML = table(["名字", "类型", "白名单", "租约", "操作"], s.creds.map(c => [
-    `<span class="mono">${esc(c.name)}</span><div class="subline">${esc(c.type)} · ${esc(c.domains.join(", "))} · ${c.lease_state === "none" ? "无租约" : (c.lease_state === "expired" ? "已过期 " + Math.abs(c.days_left) + " 天" : "剩 " + c.days_left + " 天")}</div>`,
-    esc(c.type),
-    `<span class="domains mono">${esc(c.domains.join(", "))}</span>`,
-    leaseCell(c),
-    `<div class="row-actions">
-       <button onclick="rotate('${esc(c.name)}')">轮换</button>
-       <button onclick="setLease('${esc(c.name)}', ${c.lease || 0})">设租约</button>
-       <button onclick="editDomains('${esc(c.name)}','${esc(c.domains.join(","))}')">改白名单</button>
-       <button class="danger" onclick="rmCred('${esc(c.name)}')">删除</button>
-     </div>`
+  const leaseText = (c) => c.lease_state === "none" ? "无租约"
+    : c.lease_state === "expired" ? `已过期 ${Math.abs(c.days_left)} 天` : `剩 ${c.days_left} 天`;
+  function scopeCell(c) {
+    if (c.type === "totp") return '<span class="domains">不适用</span>';
+    const m = (c.methods || []).join(","), pth = (c.paths || []).join(",");
+    if (!m && !pth) return '<span class="bad">未收紧</span>';
+    return `<span class="domains mono">${esc(m || "*")} ${esc(pth || "*")}</span>`;
+  }
+  function actionCell(c) {
+    const btns = [];
+    if (c.type !== "totp") {
+      btns.push(`<button onclick="rotate('${esc(c.name)}')">轮换</button>`);
+      btns.push(`<button onclick="setLease('${esc(c.name)}', ${c.lease || 0})">设租约</button>`);
+      btns.push(`<button onclick="editScope('${esc(c.name)}','${esc((c.methods||[]).join(","))}','${esc((c.paths||[]).join(","))}')">设作用域</button>`);
+    } else {
+      btns.push(`<button onclick="rotate('${esc(c.name)}')">换种子</button>`);
+    }
+    btns.push(`<button onclick="editDomains('${esc(c.name)}','${esc(c.domains.join(","))}')">改白名单</button>`);
+    btns.push(`<button class="danger" onclick="rmCred('${esc(c.name)}')">删除</button>`);
+    return `<div class="row-actions">${btns.join("")}</div>`;
+  }
+  $("#creds").innerHTML = table(["名字", "类型", "白名单", "租约", "作用域", "操作"], s.creds.map(c => {
+    const head = `<span class="mono">${esc(c.name)}</span><div class="subline">${esc(c.type)} · ${esc(c.domains.join(", ") || "—")} · ${leaseText(c)}</div>`;
+    return [head,
+      {html: esc(c.type), cls: "dup"},
+      {html: esc(c.domains.join(", ") || "—"), cls: "dup"},
+      {html: leaseText(c), cls: "dup"},
+      scopeCell(c),
+      actionCell(c)];
+  }));
+  $("#factors").innerHTML = table(["名字", "站点", "上次使用", "状态"], (s.factors || []).map(f => [
+    `<span class="mono">${esc(f.name)}</span>`,
+    esc(f.site || "-"),
+    `<span class="domains">${esc((f.last || "").replace("T", " ").slice(0, 16) || "从未")}</span>`,
+    f.legacy ? '<span class="unknown">已归档</span>' : '<span class="ok">在册</span>'
   ]));
+  $("#facCount").textContent = (s.factors || []).length + " 个";
+  const an = s.anchor || {};
+  $("#anchor").innerHTML = !an.exists ? '<span class="domains">还没导出过</span>'
+    : an.status === "ok" ? `<span class="ok">✓ 与锚一致</span> <span class="domains">（${esc(an.rows)} 行，${esc(an.ts)}）</span>`
+    : `<span class="bad">✗ ${esc(an.detail || an.status)}</span>`;
   const now = Date.now() / 1000;
-  $("#sessions").innerHTML = table(["名字", "域名", "保存", "操作"], s.sessions.map(x => [
+  $("#sessions").innerHTML = table(["名字", "域名", "到期", "自动重登", "操作"], s.sessions.map(x => [
     `<span class="mono">${esc(x.name)}</span>`,
     esc(x.domain),
-    `${esc(x.saved)} ${pill(!x.expires || true)}`,
+    `${x.expired ? '<span class="bad">已过期</span>' : (x.days_left === null ? '<span class="domains">—</span>' : `<span class="ok">剩 ${x.days_left} 天</span>`)} <span class="domains">${esc(x.expires || "")}</span>`,
+    x.profile ? '<span class="ok">有档案</span>' : '<span class="unknown">无</span>',
     `<div class="row-actions">
        <button onclick="checkSess('${esc(x.name)}')">探一次</button>
        <button class="danger" onclick="rmSess('${esc(x.name)}')">删除</button>
@@ -186,6 +236,13 @@ async function setLease(name, cur) {
   const v = prompt(`给 ${name} 设租约天数（0 = 不设，从今天重新计时）`, cur || 90);
   if (v === null) return;
   await post({op: "cred_lease", name, days: parseInt(v, 10) || 0});
+}
+function editScope(name, curM, curP) {
+  const m = prompt(`给 ${name} 允许的方法（逗号分隔，留空=不限）`, curM);
+  if (m === null) return;
+  const p = prompt(`给 ${name} 允许的路径前缀（逗号分隔，留空=不限）`, curP);
+  if (p === null) return;
+  post({op: "cred_scope", name, methods: m, paths: p});
 }
 function editDomains(name, cur) {
   const v = prompt(`改 ${name} 的域名白名单（逗号分隔）`, cur);
@@ -224,6 +281,8 @@ $("#btnFeedback").onclick = () => {
     encodeURIComponent("[bug] ") + "&body=" + encodeURIComponent(body);
   window.open(url, "_blank", "noopener");
 };
+$("#btnAdopt").onclick = () => post({op: "cred_adopt"});
+$("#btnAnchor").onclick = () => post({op: "audit_anchor"});
 $("#btnRevoke").onclick = () => post({op: "revoke_list"});
 $("#btnVerify").onclick = () => post({op: "audit_verify"});
 load();

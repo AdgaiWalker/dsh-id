@@ -43,10 +43,11 @@ def _norm_domains(v):
 
 
 def state():
-    creds = []
+    creds, factors, unscoped = [], [], []
     for m in V.list_credentials():
         lstate, left = V.lease_state(m)
-        creds.append({
+        sc = V.scope_of(m)
+        item = {
             "name": m.get("name", "?"),
             "type": m.get("type", "?"),
             "domains": _norm_domains(m.get("domains")),
@@ -54,15 +55,32 @@ def state():
             "lease": m.get("lease_days", 0),
             "lease_state": lstate,
             "days_left": left,
-        })
+            "methods": sc["methods"],
+            "paths": sc["paths"],
+            "legacy": bool(m.get("legacy_file")),
+        }
+        creds.append(item)
+        if item["type"] in V.NO_EXEC_TYPES:
+            lu = V.last_used(item["name"], actions=("login", "totp")) or {}
+            factors.append({"name": item["name"], "type": item["type"],
+                            "site": (item["domains"] or ["-"])[0],
+                            "last": lu.get("ts") or "",
+                            "legacy": item["legacy"]})
+        elif not sc["methods"] and not sc["paths"]:
+            unscoped.append(item["name"])
+    profiles = {p.get("name") for p in V.list_login_profiles()}
     sessions = []
     for s in V.list_sessions():
+        exp = int(s.get("expires_at") or 0)
         sessions.append({
             "name": s.get("name", "?"),
             "domain": s.get("domain", "?"),
             "saved": s.get("saved_at_str", ""),
             "expires": s.get("expires_at_str", ""),
             "cookies": s.get("cookies", ""),
+            "days_left": max(0, -((int(__import__("time").time()) - exp) // 86400)) if exp else None,
+            "expired": V.session_expired(s),
+            "profile": s.get("name") in profiles,
         })
     ok, problems, total, legacy = V.verify_chain()
     if ok is None:
@@ -80,8 +98,24 @@ def state():
         pending = 0
     qdirs = [d["stamp"] for d in V.list_quarantines()]
     recent = V.recent_logs(20)
-    return {"creds": creds, "sessions": sessions, "audit": audit,
+    legacy_pending = [x for x in V.legacy_files() if not V.meta_exists(x["name"])]
+    anchor_path = os.path.join(V._vault_dir(), "audit-anchor.json")
+    if not os.path.exists(anchor_path):
+        anchor_path = os.path.expanduser("~/.dsh/log/dsh-id-audit-anchor.json")
+    anchor = {"exists": os.path.exists(anchor_path)}
+    if anchor["exists"]:
+        try:
+            with open(anchor_path, encoding="utf-8") as fh:
+                rec = json.load(fh)
+            status, detail = V.verify_anchor(anchor_path)
+            anchor.update({"rows": rec.get("rows"), "ts": rec.get("ts_str"),
+                           "status": status, "detail": detail})
+        except Exception as exc:
+            anchor.update({"status": "unknown", "detail": str(exc)[:120]})
+    return {"creds": creds, "factors": factors, "sessions": sessions, "audit": audit,
             "pending": pending, "quarantines": qdirs, "logs": recent,
+            "unscoped": unscoped, "legacy_pending": len(legacy_pending),
+            "anchor": anchor,
             "version": V.VERSION, "repo": "AdgaiWalker/dsh-id",
             "vault": V._vault_dir(), "types": list(TYPES)}
 
@@ -175,6 +209,30 @@ def action(op, body):
         tail = " ".join(out.strip().splitlines()[-2:])[:200]
         return rc == 0, (tail or "已检查")
 
+    if op == "cred_adopt":
+        rc, out = _run("vault-cred", "adopt")
+        if rc != 0:
+            return False, (out.strip().splitlines()[-1] if out.strip() else "归档失败")
+        return True, "已把老格式密文登记进索引（密文未改动）"
+
+    if op == "cred_scope":
+        name = str(body.get("name", "")).strip()
+        if not name:
+            return False, "缺名字"
+        methods = _norm_domains(body.get("methods"))
+        paths = _norm_domains(body.get("paths"))
+        args = ["scope", name, "--methods", ",".join(methods), "--paths", ",".join(paths)]
+        rc, out = _run("vault-cred", *args)
+        if rc != 0:
+            return False, (out.strip().splitlines()[-1] if out.strip() else "设置失败")
+        return True, out.strip().splitlines()[0]
+
+    if op == "audit_anchor":
+        rc, out = _run("vault-cred", "audit-anchor")
+        if rc != 0:
+            return False, (out.strip().splitlines()[-1] if out.strip() else "导出失败")
+        return True, out.strip().splitlines()[0]
+
     if op == "revoke_list":
         p = os.path.join(V._vault_dir(), "REVOKE.md")
         rc, out = _run("vault-cred", "revoke-list", "--out", p)
@@ -188,14 +246,36 @@ def action(op, body):
             with urllib.request.urlopen(req, timeout=6) as r:
                 latest = json.load(r).get("tag_name", "").lstrip("v")
         except urllib.error.HTTPError as exc:
+            if exc.code in (403, 429):
+                cache = os.path.join(V._vault_dir(), "release-cache.json")
+                if os.path.exists(cache):
+                    try:
+                        with open(cache, encoding="utf-8") as fh:
+                            c = json.load(fh)
+                        return True, f"GitHub 限流（HTTP {exc.code}）；用上次结果：上游 {c.get('latest')}，当前 {V.VERSION}"
+                    except Exception:
+                        pass
+                return False, f"GitHub 限流（HTTP {exc.code}），过一会儿再试"
             if exc.code == 404:
                 return True, f"仓库还没发过 release（当前 {V.VERSION}）"
             return False, f"检查失败: HTTP {exc.code}"
         except Exception as exc:
             return False, f"检查失败（离线？）: {exc}"
-        newer = latest and latest != V.VERSION
-        return True, (f"有新版本 {latest}（当前 {V.VERSION}）" if newer
-                      else f"已是最新 {V.VERSION}")
+        def _v(x):
+            try:
+                return tuple(int(p) for p in str(x).lstrip("v").split(".")[:3])
+            except Exception:
+                return (0,)
+        try:
+            with open(os.path.join(V._vault_dir(), "release-cache.json"), "w") as fh:
+                json.dump({"latest": latest, "at": int(__import__("time").time())}, fh)
+        except Exception:
+            pass
+        if not latest:
+            return False, "Release 里没读到版本号"
+        if _v(latest) > _v(V.VERSION):
+            return True, f"有新版本 {latest}（当前 {V.VERSION}）"
+        return True, f"已是最新（当前 {V.VERSION}，上游 {latest}）"
 
     if op == "audit_verify":
         ok, problems, total, legacy = V.verify_chain()
@@ -226,12 +306,21 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(raw)
 
     def _origin_ok(self):
+        """同源即可：经隧道/反代访问时 Origin 是 https://<公网 host>，Host 也是它。
+        跨站（含恶意页面）Origin 的 host 与 Host 不同 → 拒绝。"""
         origin = self.headers.get("Origin")
         if not origin:
             return True
-        host = self.headers.get("Host", "")
-        return origin in (f"http://{host}", f"http://127.0.0.1:{self.server.server_port}",
-                          f"http://localhost:{self.server.server_port}")
+        try:
+            p = urllib.parse.urlparse(origin)
+        except Exception:
+            return False
+        oh = (p.netloc or "").lower()
+        host = (self.headers.get("Host") or "").lower()
+        if oh and oh == host:
+            return True
+        return oh in (f"127.0.0.1:{self.server.server_port}",
+                      f"localhost:{self.server.server_port}")
 
     def do_GET(self):
         path = urllib.parse.urlparse(self.path).path

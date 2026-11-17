@@ -171,6 +171,33 @@ def collect_checks(check_update=False):
         "ok" if okc else ("unknown" if okc is None else "bad")],
         "dsh-id creds audit-verify")
 
+    # 账实一致（v0.2.0）：vault 里有、索引里没有 = 面板看不见的秘密
+    legacy_pending = [x["name"] for x in V.legacy_files() if not V.meta_exists(x["name"])]
+    add("账实一致", not legacy_pending,
+        f"索引 {len(creds)} 个，另有 {len(legacy_pending)} 个未入索引"
+        + (f"（{', '.join(legacy_pending[:4])}）" if legacy_pending else ""),
+        "dsh-id creds adopt")
+
+    totps = [c["name"] for c in creds if c.get("type") in V.NO_EXEC_TYPES]
+    add("第二因素", True, f"{len(totps)} 个种子" + (f"（{', '.join(totps)}）" if totps else ""),
+        "dsh-id creds add <名字> totp")
+
+    unscoped = [c["name"] for c in creds
+                if c.get("type") not in V.NO_EXEC_TYPES
+                and not V.scope_of(c)["methods"] and not V.scope_of(c)["paths"]]
+    add("作用域", not unscoped,
+        f"{len(unscoped)} 个凭据未收紧" + (f"（{', '.join(unscoped[:4])}）" if unscoped else ""),
+        "dsh-id creds scope <名字> --methods GET,POST --paths /repos/")
+
+    anchor_path = os.path.join(vd, "audit-anchor.json")
+    if not os.path.exists(anchor_path):
+        anchor_path = os.path.expanduser("~/.dsh/log/dsh-id-audit-anchor.json")
+    if not os.path.exists(anchor_path):
+        add("机外锚", None, "还没导出过", "dsh-id creds audit-anchor --out <机外路径>")
+    else:
+        st, detail = V.verify_anchor(anchor_path)
+        add("机外锚", st == "ok", detail, "若 rewritten/truncated：日志不可信")
+
     pend = 0
     try:
         with open(os.path.join(vd, "guard-pending.json"), encoding="utf-8") as fh:

@@ -35,12 +35,19 @@ RULES_FILE = os.path.join(VAULT_DIR, "guard-rules.yaml")
 PENDING_FILE = os.path.join(VAULT_DIR, "guard-pending.json")
 STATE_FILE = os.path.join(VAULT_DIR, "guard-state.json")
 
-# 频率/熔断默认值：规则文件没写 rate_limits 时用这套
+# 频率/熔断默认值：规则文件里缺的键，用这套补（v0.2.0：加了 login）
 RATE_DEFAULTS = {
     "publish": {
         "match": ["发布", "发帖", "发一条", "post", "publish", "tweet"],
         "max_per_day": 3,
         "min_interval_minutes": 30,
+        "max_consecutive_failures": 2,
+    },
+    # 登录不管频次，只管熔断：2FA 连错两次就停手，否则平台会锁定账号
+    "login": {
+        "match": ["login", "登录", "2fa", "二次验证"],
+        "max_per_day": 0,
+        "min_interval_minutes": 0,
         "max_consecutive_failures": 2,
     },
 }
@@ -144,8 +151,10 @@ def check(text):
 # ── 待批准队列 ──────────────────────────────────────────────────────────────
 
 def load_rate_rules():
-    rules = load_rules().get("rate_limits") or {}
-    return rules if rules else RATE_DEFAULTS
+    """文件里的规则覆盖默认值，但缺的键（如 login）永远有默认。"""
+    rules = dict(RATE_DEFAULTS)
+    rules.update(load_rules().get("rate_limits") or {})
+    return rules
 
 
 def _today():

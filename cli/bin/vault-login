@@ -39,20 +39,63 @@ DEFAULTS = {
 }
 
 
-def totp_code(seed, digits=6, period=30):
-    """RFC 6238 TOTP（SHA1）。seed 是 base32（大小写、空格、= 都不计较）。"""
+def totp_code(seed, digits=6, period=30, offset=0):
+    """RFC 6238 TOTP（SHA1）。offset 是时间步偏移，用来补偿时钟漂移（只允许 ±1）。"""
     s = str(seed).replace(" ", "").replace("-", "").upper()
     s += "=" * (-len(s) % 8)
     try:
         key = base64.b32decode(s, casefold=True)
     except Exception:
         raise SystemExit("vault-login: TOTP 种子不是合法 base32")
-    counter = int(time.time()) // period
+    counter = int(time.time()) // period + int(offset)
     msg = struct.pack(">Q", counter)
     digest = hmac.new(key, msg, hashlib.sha1).digest()
     off = digest[-1] & 0x0F
     code = (struct.unpack(">I", digest[off:off + 4])[0] & 0x7FFFFFFF) % (10 ** digits)
     return f"{code:0{digits}d}"
+
+
+def wait_fresh_step(period=30, min_left=5):
+    """快到期就先等下一格：一秒钟后过期的码填进去就是失败，白记一次失败。"""
+    left = period - (time.time() % period)
+    if left < min_left:
+        time.sleep(left + 0.5)
+
+
+def otp_rejected(page, otp_sel):
+    """码被拒的迹象：验证码框还在，或页面出现错误提示。"""
+    try:
+        if page.locator(otp_sel + ":visible").count() > 0:
+            return True
+        html = (page.content() or "").lower()
+        for k in ("invalid code", "incorrect code", "code is invalid", "代码无效",
+                  "验证码错误", "验证码不正确", "try again"):
+            if k in html:
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def _login_breaker(name):
+    """2FA 失败熔断：连错 2 次就停手（防止撞到平台锁号）。"""
+    try:
+        import guardlib as G
+    except Exception:
+        return None
+    try:
+        st = G.rate_check("login 登录", scope="login:" + name)
+    except Exception:
+        return None
+    return None if st.get("decision") == "allow" else st.get("reason")
+
+
+def _login_record(name, ok):
+    try:
+        import guardlib as G
+        G.record("login 登录", ok=ok, scope="login:" + name)
+    except Exception:
+        pass
 
 
 def shot(page, tag):
@@ -97,18 +140,37 @@ def main():
     ap.add_argument("--url", required=True, help="登录页 URL")
     ap.add_argument("--cred", required=True, help="凭据名（basic 类型，值形如 user:pass）")
     ap.add_argument("--totp", help="TOTP 种子所在的凭据名（可选）")
-    ap.add_argument("--method", default="password", choices=["password"],
-                    help="登录方式（目前支持账号密码；SSO/扫码请人工）")
+    ap.add_argument("--method", default=None, choices=["password", "totp", "manual"],
+                    help="第二因素走法：totp=自动算码（默认，有 --totp 时）；"
+                         "manual=人工在窗口里过；password=这个站没有第二步")
     ap.add_argument("--headless", action="store_true", help="无头模式（默认有头，便于人工接手）")
     ap.add_argument("--manual-2fa", action="store_true", help="2FA 不自动填，等你在窗口里操作")
     ap.add_argument("--wait-2fa", type=int, default=120, help="人工 2FA 最多等几秒（默认 120）")
     ap.add_argument("--no-save", action="store_true", help="只登录，不保存会话")
-    ap.add_argument("--ttl-days", type=int, default=30)
+    ap.add_argument("--ttl-days", type=int, default=V.SESSION_TTL_DEFAULT)
     ap.add_argument("--user-selector")
     ap.add_argument("--pass-selector")
     ap.add_argument("--submit-selector")
     ap.add_argument("--otp-selector")
     args = ap.parse_args()
+
+    method = args.method or ("totp" if args.totp else "manual")
+    if method == "totp" and not args.totp:
+        print("vault-login: --method totp 需要 --totp <种子名>", file=sys.stderr)
+        raise SystemExit(2)
+
+    # 登录档案：只记「怎么登」（URL/选择器/用哪个凭据），没有值。
+    # 会话到期后 vault-session 靠它自动重登——这才是会话能短的前提。
+    try:
+        V.save_login_profile(args.name, {
+            "url": args.url, "cred": args.cred, "totp": args.totp, "method": method,
+            "headless": bool(args.headless),
+            "user_selector": args.user_selector, "pass_selector": args.pass_selector,
+            "submit_selector": args.submit_selector, "otp_selector": args.otp_selector,
+            "ttl_days": args.ttl_days, "wait_2fa": args.wait_2fa,
+        })
+    except Exception as e:
+        print(f"vault-login: 登录档案没存上（不影响这次登录）: {e}", file=sys.stderr)
 
     try:
         secret = V.load_secret(args.cred)
@@ -163,7 +225,8 @@ def main():
 
             otp_sel = args.otp_selector or DEFAULTS["otp"]
             if page.locator(otp_sel + ":visible").count() > 0 or "otp" in page.url.lower():
-                if args.manual_2fa or not otp_seed:
+                use_manual = args.manual_2fa or method != "totp" or not otp_seed
+                if use_manual:
                     print(f"需要 2FA：请在窗口里完成（最多等 {args.wait_2fa} 秒）…")
                     for _ in range(args.wait_2fa):
                         page.wait_for_timeout(1000)
@@ -171,12 +234,29 @@ def main():
                             break
                     steps.append(("人工 2FA 后", shot(page, "04-2fa-manual")))
                 else:
-                    code = totp_code(otp_seed)
-                    fill_first(page, otp_sel, code, "验证码")
-                    steps.append(("已填 TOTP", shot(page, "05-totp-filled")))
-                    page.locator((args.submit_selector or DEFAULTS["submit"])).first.click()
-                    page.wait_for_timeout(4000)
-                    steps.append(("提交 TOTP", shot(page, "06-totp-submit")))
+                    breaker = _login_breaker(args.name)
+                    if breaker:
+                        print(f"vault-login: {breaker}", file=sys.stderr)
+                        steps.append(("断路器已开", shot(page, "04b-breaker")))
+                        raise SystemExit(7)
+                    wait_fresh_step()          # 别用一个一秒钟后过期的码
+                    passed = False
+                    for attempt, offset in enumerate((0, 1)):
+                        code = totp_code(otp_seed, offset=offset)
+                        fill_first(page, otp_sel, code, "验证码")
+                        steps.append((f"已填 TOTP（偏移 {offset:+d}）", shot(page, "05-totp-filled")))
+                        page.locator((args.submit_selector or DEFAULTS["submit"])).first.click()
+                        page.wait_for_timeout(4000)
+                        steps.append(("提交 TOTP", shot(page, "06-totp-submit")))
+                        if not otp_rejected(page, otp_sel):
+                            passed = True
+                            break
+                        steps.append((f"第 {attempt + 1} 次被拒", shot(page, f"06b-rejected-{attempt + 1}")))
+                    _login_record(args.name, passed)
+                    if not passed:
+                        print("vault-login: 2FA 两次都没过（已含 +1 步时钟补偿）。"
+                              "停手，不再重试——继续撞会触发风控/锁号。", file=sys.stderr)
+                        raise SystemExit(5)
 
             page.wait_for_timeout(1500)
             ok, reason = looks_logged_in(page)

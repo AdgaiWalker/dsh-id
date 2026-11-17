@@ -96,8 +96,13 @@ PROXY_PORT = 48771
 # 凭据名：与 agent-id 一致，URL 安全
 CREDNAME_RE = re.compile(r"^[a-zA-Z0-9._-]{1,64}$")
 
-# 本步支持的类型（方案 §3 的前四种）
-SUPPORTED_TYPES = ("bearer", "basic", "header", "query")
+# 凭据类型。v0.2.0 起 totp 单列一类：
+#   - 它不能注入 HTTP（种子一旦被当成 Bearer 发出去就是灾难）
+#   - 它不受租约约束（"作废"一个种子等于把账号锁死，而不是轮换）
+HTTP_TYPES = ("bearer", "basic", "header", "query")
+NO_EXEC_TYPES = ("totp",)
+NO_LEASE_TYPES = ("totp",)
+SUPPORTED_TYPES = HTTP_TYPES + NO_EXEC_TYPES
 
 
 class VaultError(Exception):
@@ -873,6 +878,14 @@ def _meta_path(name):
 
 
 def _secret_path(name):
+    """密文位置：元数据里带 legacy_file 的（v0.2.0 前的裸文件）就地读，不搬不改。"""
+    try:
+        meta = load_meta(name)
+    except (VaultError, ValueError):
+        meta = {}
+    lf = meta.get("legacy_file")
+    if lf:
+        return os.path.join(_vault_dir(), os.path.basename(lf))
     return os.path.join(proxy_dir(), name + ".secret.enc")
 
 
@@ -880,7 +893,7 @@ def meta_exists(name) -> bool:
     return os.path.exists(_meta_path(name))
 
 
-VERSION = "0.1.2"
+VERSION = "0.2.0"
 LOG_KEEP_DAYS = 14
 
 
@@ -970,6 +983,8 @@ def lease_expiry(meta):
 
 def lease_state(meta, now_ts=None):
     """(state, days_left)；state ∈ ok / expired / none。"""
+    if meta.get("type") in NO_LEASE_TYPES:
+        return "none", None            # 第二因素种子不过期
     exp = lease_expiry(meta)
     if exp is None:
         return "none", None
@@ -1010,13 +1025,20 @@ def load_secret(name) -> str:
 
 
 def save_secret(name, value: str):
+    """写新值。若该名字来自老格式裸文件，改成新格式存放并清掉 legacy_file。"""
     os.makedirs(proxy_dir(), mode=0o700, exist_ok=True)
-    path = _secret_path(name)
+    path = os.path.join(proxy_dir(), name + ".secret.enc")
     tmp = path + ".tmp"
     with open(tmp, "wb") as f:
         f.write(encrypt(value))
     os.chmod(tmp, 0o600)
     os.replace(tmp, path)
+    try:
+        meta = load_meta(name)
+    except (VaultError, ValueError):
+        return
+    if meta.pop("legacy_file", None) or meta.pop("legacy_kind", None):
+        save_meta(meta)
 
 
 def list_credentials():
@@ -1037,11 +1059,204 @@ def list_credentials():
 
 def remove_credential(name):
     removed = []
+    meta = {}
+    try:
+        meta = load_meta(name)
+    except (VaultError, ValueError):
+        pass
     for p in (_meta_path(name), _secret_path(name)):
         if os.path.exists(p):
             os.remove(p)
             removed.append(p)
     return removed
+
+
+# ── 旧格式归档（v0.2.0 · M0 账实一致）────────────────────────────────────────
+#
+# v0.2.0 之前有两套存法：索引里的 proxy/<name>.secret.enc + <name>.meta.json，
+# 和 vault 根目录下的裸文件 <name>__<kind>.enc / <name>.enc。
+# 后者不进索引 → 面板看不见，于是真的丢过一个（paypal__totp.enc）。
+# adopt_legacy 只**补元数据**：不重新加密、不移动、不改动任何密文字节。
+
+LEGACY_ENC_RE = re.compile(r"^(?P<stem>.+?)__(?P<kind>[A-Za-z0-9_-]+)\.enc$")
+LEGACY_RESERVED = ("vault.key.enc", "vault.key.machine.enc", "master.enc")
+LEGACY_KIND_TYPE = {"totp": "totp", "totp_seed": "totp"}
+
+
+def legacy_files():
+    """vault 根目录下还没入索引的老格式密文。"""
+    d = _vault_dir()
+    if not os.path.isdir(d):
+        return []
+    out = []
+    for fn in sorted(os.listdir(d)):
+        if not fn.endswith(".enc") or fn.endswith(".secret.enc"):
+            continue
+        if fn in LEGACY_RESERVED or fn.startswith("vault.key"):
+            continue
+        p = os.path.join(d, fn)
+        if not os.path.isfile(p):
+            continue
+        m = LEGACY_ENC_RE.match(fn)
+        if m:
+            name, kind = m.group("stem"), m.group("kind").lower()
+        else:
+            name, kind = fn[:-4], ""
+        if not CREDNAME_RE.match(name):
+            continue
+        out.append({"file": fn, "name": name, "kind": kind, "size": os.path.getsize(p)})
+    return out
+
+
+def adopt_legacy(dry_run=False):
+    """把老格式密文登记进索引。返回 [(name, kind, action)]，action ∈ adopted/already_indexed。
+
+    只补 meta，不动密文；老凭据不追溯作废（lease_days=0）。
+    """
+    results = []
+    for item in legacy_files():
+        if meta_exists(item["name"]):
+            results.append((item["name"], item["kind"], "already_indexed"))
+            continue
+        ctype = LEGACY_KIND_TYPE.get(item["kind"], "bearer")
+        meta = {
+            "name": item["name"],
+            "type": ctype,
+            "domains": [],
+            "created_at": int(os.path.getmtime(os.path.join(_vault_dir(), item["file"]))),
+            "adopted_at": int(time.time()),
+            "legacy_file": item["file"],
+            "legacy_kind": item["kind"] or "-",
+            "note": "v0.2.0 归档：原密文未重新加密",
+        }
+        if ctype not in NO_LEASE_TYPES:
+            meta["lease_days"] = 0
+        if not dry_run:
+            save_meta(meta)
+            audit_event(action="cred_adopt", cred=item["name"], host="-", path="-",
+                        status=0, note="legacy=%s kind=%s" % (item["file"], item["kind"] or "-"))
+            app_log("adopt", cred=item["name"], kind=item["kind"] or "-")
+        results.append((item["name"], item["kind"], "adopted"))
+    return results
+
+
+# ── 作用域（v0.2.0 · M1）────────────────────────────────────────────────────
+#
+# 域名白名单只说「能发给谁」，不说「能对它做什么」：拿到 github-pat 就能
+# `-X DELETE /repos/...`。scope 把授权下沉到 method + 路径前缀。
+# 没设 scope 的老凭据保持向后兼容，但 doctor / 面板会标「未收紧」。
+
+
+def scope_of(meta):
+    return {
+        "methods": [str(m).upper() for m in (meta.get("methods") or [])],
+        "paths": [str(p) for p in (meta.get("paths") or [])],
+    }
+
+
+def scope_allows(meta, method, path):
+    """(allowed, reason)。两边都没设 → 允许（老凭据），并如实说明未收紧。"""
+    sc = scope_of(meta)
+    if not sc["methods"] and not sc["paths"]:
+        return True, "未设作用域（向后兼容，未收紧）"
+    m = (method or "GET").upper()
+    if sc["methods"] and m not in sc["methods"]:
+        return False, "方法 %s 不在允许列表 %s" % (m, ",".join(sc["methods"]))
+    p = path or "/"
+    if sc["paths"] and not any(p.startswith(pref) for pref in sc["paths"]):
+        return False, "路径 %s 不在允许前缀 %s" % (p, ", ".join(sc["paths"]))
+    return True, "作用域内"
+
+
+def set_scope(name, methods=None, paths=None):
+    meta = load_meta(name)
+    if meta.get("type") in NO_EXEC_TYPES:
+        raise VaultError("not_applicable", "totp 不参与 HTTP 作用域（它不能 exec）")
+    if methods is not None:
+        meta["methods"] = [str(m).strip().upper() for m in methods if str(m).strip()]
+    if paths is not None:
+        meta["paths"] = [str(p).strip() for p in paths if str(p).strip()]
+    save_meta(meta)
+    return meta
+
+
+# ── 登录档案（v0.2.0 · M2）──────────────────────────────────────────────────
+# 只记「怎么登」：URL、选择器、用哪个凭据、用哪种 2FA。没有值。
+# 会话到期后靠它自动重登 —— 这才是让会话能短的前提。
+
+
+def login_dir():
+    d = _path("login")
+    os.makedirs(d, mode=0o700, exist_ok=True)
+    return d
+
+
+def save_login_profile(name, profile):
+    if not CREDNAME_RE.match(name or ""):
+        raise VaultError("unknown_credential", "档案名非法")
+    meta = {"name": name, "updated_at": int(time.time())}
+    meta.update({k: v for k, v in profile.items() if k != "name"})
+    p = os.path.join(login_dir(), name + ".json")
+    tmp = p + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(meta, f, ensure_ascii=False, indent=2, sort_keys=True)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, p)
+    return meta
+
+
+def load_login_profile(name):
+    p = os.path.join(login_dir(), name + ".json")
+    if not os.path.exists(p):
+        return None
+    try:
+        with open(p, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def list_login_profiles():
+    d = login_dir()
+    out = []
+    for fn in sorted(os.listdir(d)):
+        if not fn.endswith(".json"):
+            continue
+        try:
+            with open(os.path.join(d, fn), encoding="utf-8") as f:
+                out.append(json.load(f))
+        except (OSError, ValueError):
+            continue
+    return out
+
+
+def last_used(name, tail=4000, actions=None):
+    """从审计日志尾部找某个名字最近一次使用（只要时间与动作，不读内容）。"""
+    p = audit_log_path()
+    if not os.path.exists(p):
+        return None
+    try:
+        with open(p, "r", encoding="utf-8", errors="replace") as f:
+            lines = f.read().splitlines()[-tail:]
+    except OSError:
+        return None
+    for raw in reversed(lines):
+        try:
+            rec = json.loads(raw)
+        except ValueError:
+            continue
+        act = str(rec.get("action") or "")
+        if rec.get("cred") != name:
+            continue
+        # 只算真的用过；归档/设租约/改作用域不是使用
+        prefixes = actions or ("exec", "rotate", "mint")
+        if not act.startswith(tuple(prefixes)):
+            continue
+        if True:
+            return {"ts": rec.get("ts"), "action": rec.get("action") or "exec",
+                    "host": rec.get("host")}
+    return None
+
 
 
 # ── 吊销 / 一键 panic ───────────────────────────────────────────────────────
@@ -1495,6 +1710,81 @@ def verify_chain(path=None):
     return (len(problems) == 0), problems, total, legacy
 
 
+def _chain_head_upto(rows):
+    """按 verify_chain 的口径，重算前 rows 条记录的链头。异常/断链 → None。"""
+    path = audit_log_path()
+    if not os.path.exists(path):
+        return None
+    expected_prev = GENESIS
+    head = GENESIS
+    seen = 0
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+        for raw in f:
+            if not raw.strip():
+                continue
+            if seen >= rows:
+                break
+            seen += 1
+            try:
+                rec = json.loads(raw)
+            except ValueError:
+                return None
+            if "hash" not in rec:
+                continue
+            prev = rec.get("prev_hash")
+            if prev != expected_prev and not (prev == GENESIS and expected_prev == GENESIS):
+                return None
+            if _chain_hash(prev or "", rec) != rec.get("hash"):
+                return None
+            expected_prev = rec.get("hash")
+            head = rec.get("hash")
+    return head if seen == rows else None
+
+
+def audit_anchor(out_path=None):
+    """导出链头（M3）。只有长度和哈希，没有请求内容，可以安全放到机外。"""
+    ok, problems, total, legacy = verify_chain()
+    rec = {
+        "ts": int(time.time()),
+        "ts_str": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
+        "rows": total,
+        "legacy_rows": legacy,
+        "head": last_hash(),
+        "chain_ok": ok,
+        "version": VERSION,
+    }
+    if out_path:
+        tmp = out_path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(rec, f, ensure_ascii=False, indent=2, sort_keys=True)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, out_path)
+    return rec
+
+
+def verify_anchor(anchor_path):
+    """拿机外保存的锚比对现在这条链。返回 (status, detail)。
+
+    status: ok / truncated（丢尾）/ rewritten（同长度但链头变了）/ unknown
+    """
+    try:
+        with open(anchor_path, encoding="utf-8") as f:
+            anchor = json.load(f)
+    except (OSError, ValueError) as e:
+        return "unknown", "读不了锚文件: %s" % e
+    rows = int(anchor.get("rows") or 0)
+    head = anchor.get("head") or ""
+    ok_now, problems, total, legacy = verify_chain()
+    if total < rows:
+        return "truncated", "日志被截断：锚记录 %d 行，现在只有 %d 行" % (rows, total)
+    recomputed = _chain_head_upto(rows)
+    if recomputed is None:
+        return "rewritten", "前 %d 行已无法通过自身校验（被改过）" % rows
+    if recomputed != head:
+        return "rewritten", "同样 %d 行但链头不一致（历史被重写）" % rows
+    return "ok", "前 %d 行与锚一致%s" % (rows, "" if ok_now else "，但当前链有其它异常")
+
+
 def eprint(*a):
     print(*a, file=sys.stderr)
 
@@ -1523,10 +1813,14 @@ def session_exists(name):
     return os.path.exists(_session_enc_path(name))
 
 
-def save_session(name, storage_state_json, domain, ttl_days=30, note=""):
+SESSION_TTL_DEFAULT = 7
+
+
+def save_session(name, storage_state_json, domain, ttl_days=None, note=""):
     """加密保存 storage_state。返回元数据 dict。"""
     if not CREDNAME_RE.match(name or ""):
         raise VaultError("unknown_credential", "会话名非法")
+    ttl_days = SESSION_TTL_DEFAULT if ttl_days is None else int(ttl_days)
     os.makedirs(session_dir(), mode=0o700, exist_ok=True)
 
     blob = encrypt(storage_state_json)

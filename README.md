@@ -92,7 +92,7 @@ install.sh  test.sh                    ← 装 CLI / 冒烟测试
 
 ```bash
 dsh-id creds add github-pat bearer --domains api.github.com
-# bearer / basic / header / query 四种注入方式
+# bearer / basic / header / query 四种注入方式；totp 是另一类（见下）
 # 交互输入值，不回显；写入后磁盘上是密文（0600）
 ```
 
@@ -130,11 +130,49 @@ dsh-id creds add github-totp  bearer --domains github.com --lease-days 0   # 值
 
 ```bash
 dsh-id session save github --url https://github.com/login --ttl-days 30
-# 开可见窗口，你手动登录完回车；默认 30 天
+# 开可见窗口，你手动登录完回车；默认 7 天（到期有登录档案就自动重登）
 dsh-id session list                                          # 域名、保存时间、过期时间
 dsh-id session use github --headless                         # 打开就是登录态
 dsh-id session check github                                  # 探一次，判断是否还有效
 ```
+
+## 第二因素（totp）与它的边界
+
+```bash
+dsh-id creds add github-totp totp                    # 值填 base32 种子；不需要白名单
+dsh-id login github --url https://github.com/login --cred github-login --totp github-totp
+```
+
+totp 是独立一类：**不能 exec、不发网络请求、没有租约**（作废一个种子等于把账号锁死）、
+面板只显示「有没有、上次用过没有」，值永不回显。
+
+**它不是「更安全」。** 种子和密码存在同一个库里，同一把机器钥匙都能解开——那是一个因素、
+两种存法。它买到的是**自动化**（不用你在旁边报码），不是第二道防线。
+
+登录有失败熔断：TOTP 允许 1 次 ±1 时间步的时钟补偿，被拒即停并熔断该账号（连错 2 次不再试），
+避免撞平台风控或锁号。
+
+## 作用域：域名之外，还管「能做什么」
+
+域名白名单只回答「能发给谁」。拿到 `github-pat` 仍然可以 `-X DELETE /repos/...`：
+
+```bash
+dsh-id creds scope github-pat --methods GET,POST --paths /repos/,/user
+# 越界：exit 9，并告你怎么开口子
+```
+
+没设作用域的老凭据保持向后兼容，`dsh-id doctor` 会把它们列成「未收紧」。
+
+## 账实一致与机外锚
+
+```bash
+dsh-id creds adopt                          # 老格式裸密文入索引（只补元数据，不重新加密）
+dsh-id creds audit-anchor --out ~/锚.json    # 导出链头，放到机外
+dsh-id creds audit-verify --anchor ~/锚.json # 能识别「截断」与「重写」
+```
+
+审计链防误改，但同权限者可以整链重算。机外锚是唯一真正的见证：它记下行数与链头，
+之后无论补写多少行，前 N 行都必须对得上。
 
 ### 出事的时候
 
@@ -295,11 +333,13 @@ exit=11
 **做不到的（请当它是「限制」，不是「隔离」）**
 
 - **同用户的其他进程仍可读密钥文件**。这不是安全沙箱，是防手滑和防日志泄露的工程措施。真要隔离，得换用户/容器的边界。
-- **审计哈希链防不住同权限重写整条链**，也发现不了尾部截断。它能让「改一行」这种篡改留下痕迹，仅此而已。
+- **审计哈希链防不住同权限重写整条链**，也发现不了尾部截断。它能让「改一行」这种篡改留下痕迹，仅此而已。机外锚（`audit-anchor`）能补上「截断/重写」这一块，但前提是那枚锚真的存到了机外。
 - **`guard` 是关键词闸门，不是强制审批**。`approve --who` 由调用方填写，不能当作真实审批签名；模型也可以绕开它直接调用底层命令。
 - **`panic` 只隔离本地密文**：它不会吊销上游已经发出的 token，也不会终止别人已经打开的网页会话。真要止血，还得去平台后台 revoke。
 - **会话「过期时间」是本地 TTL**，不代表站点侧真的还有效。`session check` 是启发式探测，结果是参考不是保证。
 - 机器绑定自动解锁意味着：**能在这台机器上以这个用户身份跑代码的人，就能解密**。这是刻意的取舍（AI 要自主干活），不是疏忽。
+- **把 TOTP 种子存进同一个库，2FA 就不再是第二道防线**。它变成「一个因素、两种存法」，换来的是自动化。这不提高安全性，只提高便利性。
+- **作用域对老凭据默认不收紧**，`doctor` 会列出来；不设就一直是用域名白名单兜着。
 
 这些边界在 `dsh-id creds status` 和插件的 `*_security_boundary` 工具里也如实标着。
 
