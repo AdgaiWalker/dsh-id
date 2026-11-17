@@ -320,12 +320,10 @@ async function main() {
   const ctx = makeCtx();
   mod.apply(ctx, { vaultDir: fx.vault, accountsFile: fx.accountsFile });
   const expected = [
-    "account_vault_overview", "account_vault_accounts", "account_vault_account",
-    "account_vault_credentials", "account_vault_sessions", "account_vault_guard_status",
-    "account_vault_audit_status", "account_vault_security_boundary",
-    "account_vault_panel",
+    "account_vault_credentials", "account_vault_sessions",
+    "account_vault_security_boundary", "account_vault_panel",
   ];
-  const EXPECTED_TOTAL = expected.length + 4; // 9 只读 + 4 执行
+  const EXPECTED_TOTAL = expected.length + 4; // 4 只读 + 4 执行
   check(`注册 ${EXPECTED_TOTAL} 个工具`, ctx._tools.size === EXPECTED_TOTAL,
     `实际 ${ctx._tools.size}: ${[...ctx._tools.keys()].join(",")}`);
   for (const n of expected) check(`存在 ${n}`, ctx._tools.has(n));
@@ -351,7 +349,7 @@ async function main() {
   const R = {};
   for (const n of expected) {
     try {
-      R[n] = await ctx._tools.get(n).execute(n === "account_vault_account" ? { id: "test_mail" } : {}, {});
+      R[n] = await ctx._tools.get(n).execute({}, {});
       check(`${n} 返回对象`, R[n] && typeof R[n] === "object");
     } catch (e) {
       check(`${n} 未抛异常`, false, String(e && e.message || e));
@@ -360,9 +358,7 @@ async function main() {
 
   console.log("\n=== 4. 敏感内容不外泄（canary 全查） ===");
   // 列表类工具：任何自由文本 canary 都不得出现
-  const listTools = ["account_vault_overview", "account_vault_accounts",
-    "account_vault_credentials", "account_vault_sessions",
-    "account_vault_guard_status", "account_vault_audit_status",
+  const listTools = ["account_vault_credentials", "account_vault_sessions",
     "account_vault_security_boundary"];
   const listOut = JSON.stringify(listTools.map((n) => R[n]));
   const listCanaries = ["CANARY_VALUE", "CANARY_TOKEN", "CANARY_ENC_BLOB", "CANARY_SESSION_BLOB",
@@ -375,82 +371,6 @@ async function main() {
   check("凭据输出无 value 键", !/"value"\s*:/.test(JSON.stringify(R.account_vault_credentials)));
   check("凭据输出无 token 键", !/"token"\s*:/.test(JSON.stringify(R.account_vault_credentials)));
 
-  // 单账号查询是「有范围的逃生口」：允许返回消毒后的用途/备注，
-  // 但必须长度受限、且长 hex / token 形态被 REDACTED
-  const singleOut = JSON.stringify(R.account_vault_account);
-  check("单账号查询不含凭据 canary", !singleOut.includes("CANARY_VALUE") && !singleOut.includes("CANARY_TOKEN"));
-  check("单账号查询不含密文 blob canary",
-    !singleOut.includes("CANARY_ENC_BLOB") && !singleOut.includes("CANARY_SESSION_BLOB"));
-
-  console.log("\n=== 5. 标识符默认打码 ===");
-  const accs = R.account_vault_accounts;
-  const mailEntry = accs.identities?.find((i) => i.id === "test_mail");
-  check("邮箱已打码", mailEntry?.identifier === "t***@example.com", String(mailEntry?.identifier));
-  check("标注 identifier_masked", mailEntry?.identifier_masked === true);
-  const platEntry = accs.platforms?.find((p) => p.id === "testplat");
-  check("手机号已打码", /^138\*+00$/.test(String(platEntry?.identifier || "")), String(platEntry?.identifier));
-  check("列表不返回 purpose/note", !("purpose" in (mailEntry || {})) && !("note" in (mailEntry || {})));
-  check("明确列出被省略字段", Array.isArray(accs.omitted) && accs.omitted.includes("todo"));
-
-  console.log("\n=== 6. 单账号查询（有范围） ===");
-  const single = await ctx._tools.get("account_vault_account")
-    .execute({ id: "test_mail", reveal_identifier: true }, {});
-  check("reveal 后显示完整邮箱", single.account?.identifier === "test.person@example.com",
-    String(single.account?.identifier));
-  check("purpose 经消毒返回", typeof single.purpose === "string" && single.purpose.includes("PURPOSE_CANARY"),
-    "单账号查询可带用途，但只截断消毒后");
-  check("note 经消毒返回", typeof single.note === "string");
-  const noReveal = await ctx._tools.get("account_vault_account").execute({ id: "test_mail" }, {});
-  check("不 reveal 时仍打码", noReveal.account?.identifier === "t***@example.com");
-  const missing = await ctx._tools.get("account_vault_account").execute({ id: "nope" }, {});
-  check("不存在的 id 返回 ok:false", missing.ok === false);
-
-  console.log("\n=== 7. 审批队列：动作只给截断预览 ===");
-  const guard = R.account_vault_guard_status;
-  check("只统计 pending", guard.pending_count === 1, String(guard.pending_count));
-  const p0 = guard.pending?.[0];
-  check("有 action_preview 且被截断", typeof p0?.action_preview === "string" && p0.action_preview.length <= 61,
-    String(p0?.action_preview?.length));
-  check("给出 action_length", p0?.action_length > 100, String(p0?.action_length));
-  check("说明审批非强制", String(guard.limitation).includes("不是内核级强制"));
-
-  console.log("\n=== 8. 审计链校验（真实格式合成日志） ===");
-  buildAuditCases();
-  const auditTool = ctx._tools.get("account_vault_audit_status");
-  const auditDir = join(TMP, "auditcases");
-  await mkdir(auditDir, { recursive: true });
-
-  for (const c of AUDIT_CASES) {
-    const file = join(auditDir, "audit.log");
-    await writeFile(file, c.text);
-    // 用独立实例指向该目录
-    const c2 = makeCtx();
-    mod.apply(c2, { vaultDir: dirname(file), accountsFile: fx.accountsFile, probeUrl: "" });
-    const res = await c2._tools.get("account_vault_audit_status").execute({}, {});
-    check(`[${c.name}] status=${c.expectStatus}`, res.status === c.expectStatus,
-      `实际 ${res.status} (${res.reason})`);
-    if (c.problemLine) {
-      const lines = (res.problems || []).map((p) => p.line);
-      check(`[${c.name}] 指出第 ${c.problemLine} 行`, lines.includes(c.problemLine), JSON.stringify(lines));
-    }
-    if (c.legacy !== undefined) {
-      check(`[${c.name}] legacy=${c.legacy}`, res.legacy_lines_unverifiable === c.legacy,
-        String(res.legacy_lines_unverifiable));
-    }
-    if (c.chained !== undefined) {
-      check(`[${c.name}] chained=${c.chained}`, res.chained_lines === c.chained,
-        String(res.chained_lines));
-    }
-  }
-
-  // 缺失文件
-  const missingCtx = makeCtx();
-  mod.apply(missingCtx, { vaultDir: join(TMP, "nodir"), accountsFile: fx.accountsFile, probeUrl: "" });
-  const missRes = await missingCtx._tools.get("account_vault_audit_status").execute({}, {});
-  check("审计文件缺失 → status=unknown", missRes.status === "unknown", missRes.status);
-  check("审计文件缺失 → verifiable=false", missRes.verifiable === false);
-  check("审计文件缺失 → chain_ok 不为 true", missRes.chain_ok !== true);
-
   console.log("\n=== 9. 只读：不触碰生产端口 ===");
   check("fetch 被 stub 且已调用", fetchCalls.length > 0, String(fetchCalls.length));
   check("所有探测都指向默认本地地址", fetchCalls.every((u) => u.includes("127.0.0.1:48771")),
@@ -459,7 +379,7 @@ async function main() {
   fetchCalls = [];
   const noProbeCtx = makeCtx();
   mod.apply(noProbeCtx, { vaultDir: fx.vault, accountsFile: fx.accountsFile, probeUrl: "" });
-  await noProbeCtx._tools.get("account_vault_overview").execute({}, {});
+  await noProbeCtx._tools.get("account_vault_credentials").execute({}, {});
   check("probeUrl 为空时不发请求", fetchCalls.length === 0, String(fetchCalls.length));
 
   console.log("\n=== 10. 多实例隔离与卸载 ===");
@@ -467,7 +387,7 @@ async function main() {
   const ctxB = makeCtx();
   mod.apply(ctxA, { vaultDir: join(TMP, "vaultA"), accountsFile: fx.accountsFile, probeUrl: "" });
   mod.apply(ctxB, { vaultDir: join(TMP, "vaultB"), accountsFile: fx.accountsFile, probeUrl: "" });
-  check("两实例各注册 13 个工具", ctxA._tools.size === 13 && ctxB._tools.size === 13,
+  check("两实例各注册 8 个工具", ctxA._tools.size === 8 && ctxB._tools.size === 8,
     `${ctxA._tools.size} / ${ctxB._tools.size}`);
   check("两实例工具表相互独立", ctxA._tools !== ctxB._tools);
   const dispA = await ctxA._tools.get("account_vault_credentials").execute({}, {});
@@ -495,12 +415,9 @@ async function main() {
     JSON.stringify(bCred.credentials));
   const bSess = await bctx._tools.get("account_vault_sessions").execute({}, {});
   check("损坏会话标记为 unreadable", bSess.sessions?.some((s) => s.status === "unreadable"));
-  const bGuard = await bctx._tools.get("account_vault_guard_status").execute({}, {});
-  check("损坏队列 → pending_count 为 null 并带 error", bGuard.pending_count === null && Boolean(bGuard.error),
-    `count=${bGuard.pending_count} err=${bGuard.error}`);
   for (const n of expected) {
     try {
-      const out = await bctx._tools.get(n).execute(n === "account_vault_account" ? { id: "x" } : {}, {});
+      const out = await bctx._tools.get(n).execute({}, {});
       check(`${n} 损坏数据下不崩溃`, out && typeof out === "object");
     } catch (e) {
       check(`${n} 损坏数据下不崩溃`, false, String(e && e.message || e));

@@ -2,10 +2,10 @@
 """dsh-id — 账号凭据与登录态的统一入口。
 
 只是名字和入口，底层一个都不重写：
-  dsh-id creds    凭据：增删查测、panic/restore、审计校验     → vault-cred
-  dsh-id session  网页会话：存 / 用 / 查 / 删                  → vault-session
-  dsh-id exec     按需注入凭据发一次请求（明文不进日志/argv）  → vault-exec
-  dsh-id guard    不可逆操作审批：check / pending / approve    → vault-guard
+  dsh-id creds    凭据：增删查测、panic/restore、审计校验     → dsh-id creds
+  dsh-id session  网页会话：存 / 用 / 查 / 删                  → dsh-id session
+  dsh-id exec     按需注入凭据发一次请求（明文不进日志/argv）  → dsh-id exec
+  dsh-id guard    不可逆操作审批：check / pending / approve    → dsh-id guard
 
 不带参数时打印一屏状态，纯只读，不输出任何凭据值。
 """
@@ -19,13 +19,17 @@ import sys
 import urllib.request
 
 BIN = os.path.expanduser("~/.local/bin")
+LIBDIR = os.path.expanduser("~/.local/lib/dsh-id")
+PY = sys.executable or "python3"
+# 内部实现都在 ~/.local/lib/dsh-id；PATH 上只有 dsh-id / dsh-id-panel 和 3 个 shim
 TARGETS = {
-    "creds": "vault-cred",
-    "session": "vault-session",
-    "exec": "vault-exec",
-    "guard": "vault-guard",
-    "panel": "dsh-id-panel",
-    "login": "vault-login",
+    "creds": (PY, os.path.join(LIBDIR, "creds.py")),
+    "vault": (PY, os.path.join(LIBDIR, "creds.py"), "--vault"),
+    "session": (PY, os.path.join(LIBDIR, "session.py")),
+    "exec": (PY, os.path.join(LIBDIR, "exec.py")),
+    "guard": (PY, os.path.join(LIBDIR, "guard.py")),
+    "login": (PY, os.path.join(LIBDIR, "login.py")),
+    "panel": (os.path.join(BIN, "dsh-id-panel"),),
 }
 ALIASES = {"cred": "creds", "credo": "creds", "sessions": "session", "sess": "session"}
 
@@ -57,11 +61,11 @@ def count_rows(text):
 
 
 def status():
-    st = run("vault-cred", "status") or ""
-    creds = run("vault-cred", "list") or ""
-    sess = run("vault-session", "list") or ""
-    pend = run("vault-guard", "pending") or ""
-    audit = run("vault-cred", "audit-verify") or ""
+    st = run("dsh-id", "vault", "status") or ""
+    creds = run("dsh-id", "creds", "list") or ""
+    sess = run("dsh-id", "session", "list") or ""
+    pend = run("dsh-id", "guard", "pending") or ""
+    audit = run("dsh-id", "creds", "audit", "verify") or ""
 
     def pick(pattern, default="?"):
         m = re.search(pattern, st)
@@ -169,7 +173,7 @@ def collect_checks(check_update=False):
     add("审计链", okc is True, {"ok": f"完整（{total} 行）", "unknown": "无法校验",
                                 "bad": f"{len(probs)} 处异常"}[
         "ok" if okc else ("unknown" if okc is None else "bad")],
-        "dsh-id creds audit-verify")
+        "dsh-id creds audit verify")
 
     # 账实一致（v0.2.0）：vault 里有、索引里没有 = 面板看不见的秘密
     legacy_pending = [x["name"] for x in V.legacy_files() if not V.meta_exists(x["name"])]
@@ -263,11 +267,14 @@ def main():
         print(f"dsh-id: 不认识 '{argv[0]}'，可用的是 "
               f"{' / '.join(TARGETS)}（或直接不带参数看状态）", file=sys.stderr)
         return 2
-    exe = os.path.join(BIN, TARGETS[cmd])
-    if not os.access(exe, os.X_OK):
+    parts = TARGETS[cmd]
+    exe, args = parts[0], list(parts[1:])
+    if not os.access(exe, os.R_OK):
         print(f"dsh-id: 找不到 {exe}", file=sys.stderr)
         return 2
-    os.execv(exe, [exe, *argv[1:]])
+    if exe.endswith(".py"):
+        os.execv(exe, [exe, *args, *argv[1:]])
+    os.execv(exe, [exe, *args, *argv[1:]])
 
 
 if __name__ == "__main__":

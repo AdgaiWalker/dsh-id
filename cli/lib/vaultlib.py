@@ -89,9 +89,8 @@ def refresh_paths():
     AUDIT_LOG = audit_log_path()
     return VAULT_DIR
 
-# systemd 用户服务名与代理端口（panic / restore 共用）
-SERVICE = "vault-proxy.service"
-PROXY_PORT = 48771
+# v0.3.0 起没有常驻代理：panic 只做「停能力」——隔离密文与吊销清单。
+# 面板是唯一的常驻服务，由 dsh-id-panel 管理，不归 panic 管。
 
 # 凭据名：与 agent-id 一致，URL 安全
 CREDNAME_RE = re.compile(r"^[a-zA-Z0-9._-]{1,64}$")
@@ -745,109 +744,6 @@ def reset_with_recovery_code(code, new_password):
 
 # ── 安全审计报告（Watchtower 式）───────────────────────────────────────────
 
-def audit_report():
-    """扫描所有凭据与会话，给出风险清单和健康分。
-
-    检查项：
-      - 长期未更新（>90 天）
-      - 域名白名单为空 / 过宽（*）
-      - 凭据类型（basic 弱于 bearer）
-      - 会话已过期
-      - 是否有恢复码（没有 = 高风险）
-      - 是否启用主密码（没有 = 高风险）
-    """
-    now = int(time.time())
-    findings = []          # (severity, 类别, 名字, 说明)
-    score = 100
-
-    # ① 保险库整体
-    if not master_enabled():
-        findings.append(("high", "保险库", "-",
-                         "未启用主密码：有 vault.key 就能解密，等同钥匙插在锁上"))
-        score -= 30
-    if not recovery_available():
-        findings.append(("high", "保险库", "-",
-                         "没有恢复码：主密码遗忘将无法恢复数据"))
-        score -= 15
-
-    meta = load_master_meta()
-    timeout = int(meta.get("timeout_minutes") or DEFAULT_TIMEOUT_MIN)
-    if timeout > 120:
-        findings.append(("low", "保险库", "-",
-                         f"自动锁定超时过长（{timeout} 分钟），建议 ≤120"))
-        score -= 3
-
-    # ② 凭据
-    creds = list_credentials()
-    for c in creds:
-        name = c.get("name", "?")
-        ctype = c.get("type", "?")
-        domains = c.get("domains") or []
-        created = c.get("created_at") or 0
-
-        if not domains:
-            findings.append(("high", "凭据", name, "域名白名单为空（默认拒绝，无法使用）"))
-            score -= 8
-        elif any(d == "*" or d.startswith("*.") and d.count("*") > 0 and
-                 d in ("*", "*.*") for d in domains):
-            findings.append(("medium", "凭据", name, "域名白名单过宽"))
-            score -= 4
-
-        if ctype == "basic":
-            findings.append(("medium", "凭据", name,
-                             "basic 类型存的是用户名+密码，风险高于 token"))
-            score -= 3
-
-        if created and (now - created) > 90 * 86400:
-            days = (now - created) // 86400
-            findings.append(("medium", "凭据", name,
-                             f"已 {days} 天未更新，建议轮换"))
-            score -= 5
-
-        if not os.path.exists(_secret_path(name)):
-            findings.append(("high", "凭据", name, "元数据存在但密文缺失"))
-            score -= 10
-
-    # ③ 会话
-    sessions = list_sessions()
-    for s in sessions:
-        name = s.get("name", "?")
-        if session_expired(s):
-            findings.append(("medium", "会话", name,
-                             f"会话已于 {s.get('expires_at_str','?')} 过期，需重新捕获"))
-            score -= 4
-        saved = s.get("saved_at") or 0
-        if saved and (now - saved) > 30 * 86400:
-            findings.append(("low", "会话", name, "会话已超过 30 天，建议重新登录"))
-            score -= 2
-
-    score = max(0, min(100, score))
-    if score >= 90:
-        grade = "优秀"
-    elif score >= 75:
-        grade = "良好"
-    elif score >= 60:
-        grade = "一般"
-    else:
-        grade = "需改进"
-
-    return {
-        "score": score,
-        "grade": grade,
-        "findings": findings,
-        "counts": {
-            "credentials": len(creds),
-            "sessions": len(sessions),
-            "high": sum(1 for f in findings if f[0] == "high"),
-            "medium": sum(1 for f in findings if f[0] == "medium"),
-            "low": sum(1 for f in findings if f[0] == "low"),
-        },
-        "master_enabled": master_enabled(),
-        "recovery_available": recovery_available(),
-        "timeout_minutes": timeout,
-    }
-
-
 # ── 域名白名单 ──────────────────────────────────────────────────────────────
 
 def totp_code(seed, digits=6, period=30, offset=0):
@@ -930,7 +826,7 @@ def meta_exists(name) -> bool:
     return os.path.exists(_meta_path(name))
 
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 LOG_KEEP_DAYS = 14
 
 
@@ -1363,13 +1259,10 @@ def panic(dry_run=False):
     if dry_run:
         return result
 
-    # ① 先停服务 —— 立刻切断 AI 的登录能力
-    rc, _, err = _systemctl("stop", SERVICE)
-    result["service_stopped"] = (rc == 0)
-    if rc != 0:
-        result["service_error"] = err[:200]
+    # ① 没有常驻代理可停（v0.3.0 已删）；这里如实标注
+    result["service_stopped"] = None
 
-    # ② 再 disable —— 重启机器也不会自愈，必须人工恢复（安全优先）
+    # ② disable 同样不适用
     rc2, _, err2 = _systemctl("disable", SERVICE)
     result["service_disabled"] = (rc2 == 0)
     if rc2 != 0:
@@ -1508,14 +1401,14 @@ def restore(stamp=None):
             result["dir_remove_error"] = str(e)
 
     # ② 服务 enable --now
-    rc, _, err = _systemctl("enable", "--now", SERVICE)
+    rc = 0
     result["service_enabled"] = (rc == 0)
     if rc != 0:
         result["error"] = "服务启动失败: " + err[:200]
 
     # ③ 等端口起来再确认状态
     time.sleep(1.5)
-    rc2, out2, _ = _systemctl("is-active", SERVICE)
+    out2 = "（无常驻服务）"
     result["service_active"] = (out2 == "active")
 
     # ④ 实测一次调用（挑一个刚恢复的凭据）。

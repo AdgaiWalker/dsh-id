@@ -34,12 +34,14 @@ dsh-id exec github-pat https://api.github.com/user
 | --- | --- |
 | `dsh-id exec` | 按需注入凭据，发一次 HTTP 请求或跑一条命令，结束即失效 |
 | `dsh-id session` | 网页登录态：**登录一次**存下 cookie/localStorage，之后直接是登录态（2FA 只过一次） |
-| `dsh-id creds` | 凭据增删查测、换值（轮换）、租约到期拦截、`panic` / `restore`、审计链校验 |
+| `dsh-id creds` | 凭据增删、轮换、租约、作用域、归档、`panic` / `restore`、审计校验与机外锚 |
 | `dsh-id guard` | 不可逆操作闸门：删除/转账/发布这类动作先记一条待批准 |
 | `dsh-id panel` | 本机网页面板（127.0.0.1:8791）：看账号/会话/审计，增删改凭据 |
 | `dsh-id` | 不带参数：一屏状态（凭据数、会话数、审计链、待审批） |
 
-底层是五个独立可用的 CLI（`vault-cred` / `vault-session` / `vault-exec` / `vault-guard` / `vault-proxy`），`dsh-id` 只是统一入口，不改变它们的行为。
+v0.3.0 起只有两个真命令：`dsh-id`（伞形入口）和 `dsh-id-panel`（面板服务）。
+PATH 上另留 3 个兼容壳：`vault-exec` / `vault-session` / `vault-login` 都直接转发到 `dsh-id`。
+`vault-proxy`、`accounts`、`vault-cred`、`vault-guard` 已删除（前者是已废弃的常驻代理，后三个并入了 `dsh-id`）。
 
 ---
 
@@ -79,7 +81,8 @@ dsh-id                       # 看状态（首次会提示还没有凭据）
 
 ```text
 package.json  cordis.patch.yml  lib/   ← DSH bundle 本体
-cli/bin/  cli/lib/                     ← 五个命令行 + 两个 Python 库
+cli/bin/  cli/lib/                     ← 2 个真命令 + 3 个兼容壳 + 两个 Python 库
+cli/lib/dsh-id/                        ← 内部实现（creds/guard/exec/session/login）
 docs/plugin.md                         ← 插件安装与工具清单细则
 install.sh  test.sh                    ← 装 CLI / 冒烟测试
 ```
@@ -193,8 +196,8 @@ dsh-id creds scope github-pat --methods GET,POST --paths /repos/,/user
 
 ```bash
 dsh-id creds adopt                          # 老格式裸密文入索引（只补元数据，不重新加密）
-dsh-id creds audit-anchor --out ~/锚.json    # 导出链头，放到机外
-dsh-id creds audit-verify --anchor ~/锚.json # 能识别「截断」与「重写」
+dsh-id creds audit anchor --out ~/锚.json    # 导出链头，放到机外
+dsh-id creds audit verify --anchor ~/锚.json # 能识别「截断」与「重写」
 ```
 
 审计链防误改，但同权限者可以整链重算。机外锚是唯一真正的见证：它记下行数与链头，
@@ -226,79 +229,13 @@ dsh-id creds revoke-list        # 随时重生成：哪些 token/会话在平台
 
 `panic` 不会删你的密钥文件——密文被挪进 `.panic-<时间戳>/`，随时可恢复。
 
-### 短时令牌（GitHub App，1 小时自动过期）
-
-不存长期 PAT：用 App 私钥现换一个 1 小时的安装令牌，过期了再换。
-
-```bash
-dsh-id creds mint gh-app --app-id 123456 --installation 7890 --key ~/.config/dsh-id/app.pem
-dsh-id exec gh-app https://api.github.com/user        # 令牌已注入，不需要长令牌
-```
-
-- JWT 由 `openssl` 现签（RS256，exp ≤ 10 分钟），不引入额外依赖
-- 换到的令牌写进保险库，GitHub 侧到期时间会记进元数据
-- 测试用本地 mock（`DSH_ID_GITHUB_API`）跑通全流程，不碰真 GitHub
-
-### 面板（不用记命令）
-
-```bash
-dsh-id panel            # → http://127.0.0.1:8791
-dsh-id panel --port 9000
-```
-
-一页看完：凭据（名字/类型/白名单）、会话（域名/保存/有效期）、审计链状态、待审批、隔离目录。
-能改：新增凭据、改白名单、删凭据、删会话、探会话、生成待吊销清单。
-
-常驻方式（推荐，登录即起、只绑本机）：
-
-```bash
-cp cli/systemd/dsh-id-panel.service ~/.config/systemd/user/
-systemctl --user daemon-reload && systemctl --user enable --now dsh-id-panel
-systemctl --user status dsh-id-panel --no-pager
-```
-
-只绑 `127.0.0.1`；写操作要求自定义头 + Origin 校验（挡浏览器跨站请求）；**页面永远不显示凭据值**，
-新增时值只经一次 POST 交给 `vault-cred`（走 stdin），不落盘、不回显、不进日志。
-
-### 租约：到期自动失效（对标 Vault 的短时凭据）
-
-凭据不是永久有效的——默认 90 天租约，过期后 `exec` 直接拒绝（退出码 8），逼着轮换：
-
-```bash
-dsh-id creds add github-pat bearer --domains api.github.com --lease-days 30
-dsh-id creds add locked-key  bearer --domains api.x.com    --lease-days 0   # 0=不设租约
-dsh-id creds list                       # 多一列：剩 N 天 / 已过期 N 天 / 无租约
-dsh-id creds rotate github-pat          # 只换值，类型/白名单不变，租约重新计时
-dsh-id creds lease github-pat --days 30 --reset   # 给已有凭据补设租约（不换值）
-dsh-id creds lease github-pat --days 0            # 取消租约
-```
-
-过期了不会静默失败：
-
-```text
-$ dsh-id exec github-pat https://api.github.com/user
-vault-exec: 凭据已过期（租约 90 天，超期 10 天）——先轮换: vault-cred rotate github-pat
-exit=8
-```
-
-现有凭据没有租约字段，行为不变（列表显示「无租约」），不会被追溯设成过期。
-
-### 账目与审计
-
-```bash
-dsh-id creds audit-verify       # 逐行重算哈希链，指出第几行被动过
-dsh-id creds audit-report       # 每件凭据的健康度（多久没换、白名单、过期）
-dsh-id guard check "删除生产库" # → require_approval / allow
-```
-
----
-
 ## DSH 插件
 
 仓库根目录就是 bundle，把上面这些能力包成工具交给模型：
 
-- 9 个只读工具（含 `account_vault_panel`：确保面板在跑并给出地址）：账号/凭据/会话**元数据**、审批队列、审计链校验、边界说明
+- 4 个只读工具（含 `account_vault_panel`：确保面板在跑并给出地址）：凭据/会话**元数据**、安全边界说明
 - 4 个执行工具：带凭据发请求、用会话开浏览器、浏览器操作、关浏览器
+- v0.3.0 减掉 5 个只读工具（总览/账号列表/单账号/审批队列/审计链）：它们都能用 `dsh-id doctor`、`creds list`、`creds audit verify` 直接看到，没有必要各占一个工具
 - 全部工具都不返回凭据值；截图只返回文件路径，不返回 base64
 
 细则见 [`docs/plugin.md`](docs/plugin.md)。它与 CLI 解耦，不装插件也能用命令行。
@@ -323,7 +260,7 @@ $ dsh-id guard check "发一条帖子" --scope x-main
 throttled
   原因:    距上次太近，还需等 30 分钟
   规则:    publish  {'max_per_day': 3, 'min_interval_minutes': 30, ...}
-  ⚠ 先别做。等一会儿、或换账号、或查清失败原因后 vault-guard reset
+  ⚠ 先别做。等一会儿、或换账号、或查清失败原因后 dsh-id guard reset
 exit=11
 ```
 

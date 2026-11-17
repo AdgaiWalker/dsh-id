@@ -1,0 +1,506 @@
+#!/usr/bin/env python3
+"""dsh-id session — 网页会话捕获与复用（登录一次，之后不用再掏手机过 2FA）
+
+用法
+----
+    dsh-id session save <名字> --url <登录页> [--ttl-days 30]
+    dsh-id session use <名字> [--headless] [--port 9222] [--open <url>]
+    dsh-id session check <名字> [--probe <url>]
+    dsh-id session list
+    dsh-id session rm <名字>
+
+原理
+----
+- save：开**可见**浏览器让老板手动登录（含 2FA/验证码），回车确认后
+        用 Playwright storage_state 抓 cookies + localStorage，加密存进 vault。
+- use ：解密 storage_state → 注入新浏览器 → 该浏览器已是登录态。
+        可选输出 CDP 地址，供 AI/其它工具接管。
+- check：用会话访问探测 URL，看是否还被踢回登录页。
+
+安全
+----
+- 会话等同密码：整份 storage_state 加密（复用 vault.key / openssl aes-256-cbc）
+- 文件 600，目录 700
+- **绝不打印 cookie / localStorage 值**，审计只记域名与状态
+"""
+
+import argparse
+import json
+import os
+import signal
+import subprocess
+import sys
+import time
+import urllib.parse
+
+sys.path.insert(0, os.path.expanduser("~/.local/lib"))
+import vaultlib as V  # noqa: E402
+
+VENV_PY = "/home/happy/.local/share/dsh-id session/venv/bin/python"
+CHROME = "/usr/bin/chromium"
+
+# 登录页/登录墙的常见特征，用于 check 判断是否被踢回登录
+LOGIN_HINTS = (
+    "/login", "/signin", "/sign-in", "/auth", "/session", "/sso",
+    "accounts.google.com", "login.microsoftonline.com", "passport.",
+)
+
+
+def _ensure_playwright():
+    """确认 playwright 可用，否则给出明确指引。"""
+    if not os.path.exists(VENV_PY):
+        sys.exit("缺少 Playwright 环境。请运行:\n"
+                 "  uv venv ~/.local/share/dsh-id session/venv --python 3.14\n"
+                 "  uv pip install --python ~/.local/share/dsh-id session/venv/bin/python playwright")
+    try:
+        import playwright  # noqa: F401
+    except ImportError:
+        # 当前解释器不是 venv 里的，重启到 venv 解释器
+        os.execv(VENV_PY, [VENV_PY] + sys.argv)
+
+
+def _launch_cdp(p, headless, port, profile_dir):
+    """启动一个暴露 CDP 端口的持久化 Chromium，供 bctl 接管。
+
+    与 _launch 的区别：用 launch_persistent_context 而不是 launch，
+    这样浏览器进程常驻、CDP 端口可被外部连接。
+    """
+    import os
+    os.makedirs(profile_dir, mode=0o700, exist_ok=True)
+    return p.chromium.launch_persistent_context(
+        user_data_dir=profile_dir,
+        executable_path=CHROME,
+        headless=headless,
+        args=[
+            "--no-sandbox",
+            "--disable-dev-shm-usage",
+            "--disable-blink-features=AutomationControlled",
+            f"--remote-debugging-port={port}",
+            "--remote-allow-origins=http://127.0.0.1:%d,http://localhost:%d" % (port, port),
+        ],
+    )
+
+
+def _launch(p, headless):
+    return p.chromium.launch(
+        executable_path=CHROME,
+        headless=headless,
+        args=["--no-sandbox", "--disable-dev-shm-usage",
+              "--disable-blink-features=AutomationControlled"],
+    )
+
+
+def _looks_logged_in(page, url):
+    """判断当前页是否已登录。
+
+    要点：很多站点登录后会**隐藏**登录表单但不从 DOM 移除，
+    所以必须判断「可见性」而不是「是否存在」，否则会把已登录误判成未登录。
+    """
+    final = (page.url or "").lower()
+
+    # ① 密码框是否**可见**（隐藏的不算）
+    try:
+        pw_visible = page.evaluate("""() => {
+            const els = document.querySelectorAll('input[type=password]');
+            for (const el of els) {
+                const r = el.getBoundingClientRect();
+                const st = getComputedStyle(el);
+                if (r.width > 0 && r.height > 0 &&
+                    st.visibility !== 'hidden' && st.display !== 'none' &&
+                    st.opacity !== '0') {
+                    // 再确认没有被 display:none 的祖先容器包着
+                    let p = el;
+                    while (p && p !== document.body) {
+                        const ps = getComputedStyle(p);
+                        if (ps.display === 'none' || ps.visibility === 'hidden') break;
+                        p = p.parentElement;
+                    }
+                    if (!p || p === document.body) return true;
+                }
+            }
+            return false;
+        }""")
+    except Exception:
+        pw_visible = False
+
+    if pw_visible:
+        return False, final
+
+    # ② URL 落在登录相关路径（且没有可见密码框）→ 仍需警惕
+    #    但若页面有明确的「已登录」信号，则不采信 URL 判断
+    logged_in_signal = False
+    try:
+        logged_in_signal = page.evaluate("""() => {
+            // 常见已登录信号：登出按钮、账号菜单、含 token 的 localStorage
+            const txt = (document.body?.innerText || '').slice(0, 4000);
+            if (/登出|退出登录|logout|sign out/i.test(txt)) return true;
+            try {
+                for (const k of Object.keys(localStorage)) {
+                    if (/token|auth|session|jwt/i.test(k)) return true;
+                }
+            } catch (e) {}
+            return false;
+        }""")
+    except Exception:
+        logged_in_signal = False
+
+    if logged_in_signal:
+        return True, final
+
+    if any(h in final for h in LOGIN_HINTS):
+        return False, final
+
+    return True, final
+
+
+# ── save ────────────────────────────────────────────────────────────────────
+
+def cmd_save(args):
+    _ensure_playwright()
+    from playwright.sync_api import sync_playwright
+
+    name = args.name
+    url = args.url
+    if not V.CREDNAME_RE.match(name or ""):
+        sys.exit("会话名只能用字母数字 . _ -，长度 1-64")
+
+    print(f"将打开可见浏览器窗口，请在窗口里完成登录（含 2FA / 验证码）。")
+    print(f"登录页: {url}")
+    print()
+    print("登录完成、且页面已显示你的账号后，回到这个终端按【回车】保存会话。")
+    print("（窗口里请不要手动关掉浏览器；保存完会自动关闭）")
+    print()
+
+    with sync_playwright() as p:
+        browser = _launch(p, headless=False)
+        context = browser.new_context()
+        page = context.new_page()
+        try:
+            page.goto(url, timeout=90000, wait_until="domcontentloaded")
+        except Exception as e:
+            print(f"⚠ 打开登录页有问题（可继续手动操作）: {type(e).__name__}")
+
+        try:
+            input(">>> 登录完成后按回车保存会话... ")
+        except (EOFError, KeyboardInterrupt):
+            print("\n已取消，未保存。")
+            browser.close()
+            sys.exit(1)
+
+        # 再给页面一点时间把 cookie 落地
+        page.wait_for_timeout(1200)
+
+        ok, final = _looks_logged_in(page, url)
+        state = context.storage_state()
+        n_cookies = len(state.get("cookies") or [])
+        n_origins = len(state.get("origins") or [])
+
+        if n_cookies == 0:
+            print("⚠ 没有捕获到任何 cookie —— 可能还没登录成功，或该站不用 cookie。")
+            ans = input("仍然保存？[y/N] ").strip().lower()
+            if ans != "y":
+                browser.close()
+                sys.exit("已放弃保存")
+
+        if not ok:
+            print(f"⚠ 最终页面看起来仍在登录页: {final}")
+            ans = input("仍然保存？[y/N] ").strip().lower()
+            if ans != "y":
+                browser.close()
+                sys.exit("已放弃保存")
+
+        domain = urllib.parse.urlparse(final).netloc or urllib.parse.urlparse(url).netloc
+
+        # 序列化后立刻加密落盘
+        payload = json.dumps(state, ensure_ascii=False)
+        meta = V.save_session(name, payload, domain, ttl_days=args.ttl_days)
+        payload = None
+        state = None
+
+        browser.close()
+
+    print()
+    print(f"✓ 会话已加密保存: {name}")
+    print(f"  域名:     {meta['domain']}")
+    print(f"  cookies:  {n_cookies} 条")
+    print(f"  origins:  {n_origins} 个（localStorage）")
+    print(f"  保存时间: {meta['saved_at_str']}")
+    print(f"  过期时间: {meta['expires_at_str']}（{meta['ttl_days']} 天）")
+    print(f"  密文大小: {meta['size']} 字节")
+    print()
+    print(f"之后用: dsh-id session use {name}")
+
+    try:
+        V.audit_event(action="session_save", cred=name, host=meta["domain"],
+                      path="-", status=0,
+                      note="cookies=%d origins=%d" % (n_cookies, n_origins))
+    except Exception:
+        pass
+
+
+# ── use ─────────────────────────────────────────────────────────────────────
+
+def cmd_use(args):
+    _ensure_playwright()
+    from playwright.sync_api import sync_playwright
+
+    name = args.name
+    try:
+        meta = V.load_session_meta(name)
+        state_json = V.load_session_state(name)
+    except V.VaultError as e:
+        sys.exit(f"✗ {e}")
+
+    if V.session_expired(meta) and not args.force:
+        prof = V.load_login_profile(name)
+        if prof and not getattr(args, "no_relogin", False):
+            # 会话短期化（默认 7 天）的前提：过期能自己重建
+            print(f"会话已过期（{meta['expires_at_str']}），用登录档案自动重登…")
+            cmd = ["dsh-id login", name, "--url", prof["url"], "--cred", prof["cred"],
+                   "--method", prof.get("method") or "manual",
+                   "--ttl-days", str(prof.get("ttl_days") or V.SESSION_TTL_DEFAULT)]
+            if prof.get("totp"):
+                cmd += ["--totp", prof["totp"]]
+            if prof.get("headless"):
+                cmd += ["--headless"]
+            for k, flag in (("user_selector", "--user-selector"),
+                            ("pass_selector", "--pass-selector"),
+                            ("submit_selector", "--submit-selector"),
+                            ("otp_selector", "--otp-selector")):
+                if prof.get(k):
+                    cmd += [flag, prof[k]]
+            import subprocess as _sp
+            rc = _sp.run(cmd).returncode
+            if rc != 0:
+                sys.exit(f"✗ 自动重登失败（exit {rc}）。看 dsh-id login 输出的截图定位。")
+            meta = V.load_session_meta(name)
+            state_json = V.load_session_state(name)
+        else:
+            hint = ("这个会话没有登录档案，只能人工重登"
+                    if not prof else "加了 --no-relogin")
+            sys.exit(f"✗ 会话 {name} 已过期（{meta['expires_at_str']}）；{hint}。"
+                     f"请重新 save，或加 --force 强行尝试。")
+
+    state = json.loads(state_json)
+    state_json = None
+
+    use_cdp = bool(getattr(args, "port", None))
+
+    with sync_playwright() as p:
+        if use_cdp:
+            port = args.port
+            prof = os.path.expanduser("~/.deepseekbot/cdp-profile-%s" % name)
+            context = _launch_cdp(p, args.headless, port, prof)
+            # 持久化 context 不能直接塞 storage_state，逐个注入 cookie
+            try:
+                ck = state.get("cookies") or []
+                if ck:
+                    context.add_cookies(ck)
+            except Exception as e:
+                print("⚠ 注入 cookie 有问题: %s" % type(e).__name__)
+            browser = context  # 统一后续 close 调用
+        else:
+            browser = _launch(p, headless=args.headless)
+            context = browser.new_context(storage_state=state)
+        state = None
+        page = context.new_page()
+
+        target = args.open or f"https://{meta['domain']}/"
+        try:
+            page.goto(target, timeout=60000, wait_until="domcontentloaded")
+        except Exception as e:
+            print(f"⚠ 打开 {target} 有问题: {type(e).__name__}")
+
+        ok, final = _looks_logged_in(page, target)
+
+        print("=== 会话已恢复 ===")
+        print(f"会话:   {name}")
+        print(f"域名:   {meta['domain']}")
+        print(f"保存于: {meta['saved_at_str']}")
+        print(f"过期于: {meta['expires_at_str']}")
+        print(f"模式:   {'headless' if args.headless else '可见窗口'}")
+        print(f"打开:   {target}")
+        print(f"当前页: {final}")
+        print(("✓ 看起来已登录（未被踢回登录页）" if ok
+               else "⚠ 看起来未登录（落在登录页）"))
+        print()
+
+        try:
+            V.audit_event(action="session_use", cred=name, host=meta["domain"],
+                          path="-", status=200 if ok else 401,
+                          note="headless=%s" % args.headless)
+        except Exception:
+            pass
+
+        if args.screenshot:
+            try:
+                page.screenshot(path=args.screenshot, full_page=False)
+                print(f"截图已保存: {args.screenshot}")
+            except Exception as e:
+                print(f"⚠ 截图失败: {e}")
+
+        if use_cdp:
+            print(f"CDP 端口: 127.0.0.1:{args.port}（bctl 可接管）")
+            print(f"profile:  {prof}")
+            print("浏览器保持运行。停止方式: kill 该 chromium 进程，或 bstart --stop")
+            print("按 Ctrl+C 结束本命令（浏览器会一并关闭）")
+            try:
+                import time as _t
+                while True:
+                    _t.sleep(3600)
+            except (KeyboardInterrupt, EOFError):
+                pass
+            try:
+                context.close()
+            except Exception:
+                pass
+            return 0 if ok else 2
+
+        # 交互式：把浏览器留给老板/后续操作
+        if args.hold:
+            print("浏览器保持打开。按回车关闭并退出...")
+            try:
+                input()
+            except (EOFError, KeyboardInterrupt):
+                pass
+        elif not args.headless:
+            print("浏览器窗口已打开（可见）。按回车关闭...")
+            try:
+                input()
+            except (EOFError, KeyboardInterrupt):
+                pass
+
+        browser.close()
+
+    return 0 if ok else 2
+
+
+# ── check ───────────────────────────────────────────────────────────────────
+
+def cmd_check(args):
+    _ensure_playwright()
+    from playwright.sync_api import sync_playwright
+
+    name = args.name
+    try:
+        meta = V.load_session_meta(name)
+        state_json = V.load_session_state(name)
+    except V.VaultError as e:
+        sys.exit(f"✗ {e}")
+
+    state = json.loads(state_json)
+    state_json = None
+
+    probe = args.probe or f"https://{meta['domain']}/"
+    expired = V.session_expired(meta)
+
+    with sync_playwright() as p:
+        browser = _launch(p, headless=True)
+        context = browser.new_context(storage_state=state)
+        state = None
+        page = context.new_page()
+        try:
+            page.goto(probe, timeout=45000, wait_until="domcontentloaded")
+        except Exception as e:
+            print(f"✗ 探测失败（网络/页面问题）: {type(e).__name__}")
+            browser.close()
+            sys.exit(2)
+
+        ok, final = _looks_logged_in(page, probe)
+        browser.close()
+
+    print("=== 会话检查 ===")
+    print(f"会话:     {name}")
+    print(f"域名:     {meta['domain']}")
+    print(f"保存于:   {meta['saved_at_str']}")
+    print(f"过期于:   {meta['expires_at_str']}"
+          + ("  ⚠ 已过期" if expired else ""))
+    print(f"探测 URL: {probe}")
+    print(f"最终 URL: {final}")
+    print()
+    if ok:
+        print("✓ 会话有效（探测页未跳登录）")
+    else:
+        print("✗ 会话已失效（被踢回登录页），需要重新 save")
+
+    try:
+        V.audit_event(action="session_check", cred=name, host=meta["domain"],
+                      path="-", status=200 if ok else 401,
+                      note="expired_meta=%s" % expired)
+    except Exception:
+        pass
+
+    sys.exit(0 if ok else 2)
+
+
+# ── list / rm ───────────────────────────────────────────────────────────────
+
+def cmd_list(args):
+    sessions = V.list_sessions()
+    if not sessions:
+        print("（没有已保存的会话）")
+        return
+    print(f"{'名字':<18}{'域名':<26}{'保存时间':<21}{'过期时间':<21}{'状态'}")
+    print("-" * 100)
+    for m in sessions:
+        exp = "已过期" if V.session_expired(m) else "有效期内"
+        print(f"{m.get('name','?'):<18}{m.get('domain','?'):<26}"
+              f"{m.get('saved_at_str','?'):<21}{m.get('expires_at_str','?'):<21}{exp}")
+
+
+def cmd_rm(args):
+    removed = V.remove_session(args.name)
+    if removed:
+        print(f"✓ 已删除会话 {args.name}（{len(removed)} 个文件）")
+        try:
+            V.audit_event(action="session_rm", cred=args.name, host="-",
+                          path="-", status=0)
+        except Exception:
+            pass
+    else:
+        print(f"会话 {args.name} 不存在")
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        prog="dsh-id session", description="网页会话捕获与复用")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    p_save = sub.add_parser("save", help="开可见浏览器，手动登录后保存会话")
+    p_save.add_argument("name")
+    p_save.add_argument("--url", required=True, help="登录页 URL")
+    p_save.add_argument("--ttl-days", type=float, default=V.SESSION_TTL_DEFAULT,
+                        help="有效期天数（默认 %d）" % V.SESSION_TTL_DEFAULT)
+    p_save.set_defaults(func=cmd_save)
+
+    p_use = sub.add_parser("use", help="恢复会话并打开浏览器")
+    p_use.add_argument("name")
+    p_use.add_argument("--headless", action="store_true", help="无头模式")
+    p_use.add_argument("--no-relogin", dest="no_relogin", action="store_true",
+                       help="过期也不自动重登，直接报错")
+    p_use.add_argument("--open", help="恢复后打开哪个 URL（默认该站首页）")
+    p_use.add_argument("--screenshot", help="打开后截图保存到该路径")
+    p_use.add_argument("--hold", action="store_true", help="保持浏览器打开直到回车")
+    p_use.add_argument("--force", action="store_true", help="元数据过期也强行尝试")
+    p_use.add_argument("--port", type=int, default=None,
+                       help="暴露 CDP 端口（如 9222），让 bctl 能接管这个已登录的浏览器")
+    p_use.set_defaults(func=cmd_use)
+
+    p_check = sub.add_parser("check", help="用会话探测一次，判断是否还有效")
+    p_check.add_argument("name")
+    p_check.add_argument("--probe", help="探测 URL（默认该站首页）")
+    p_check.set_defaults(func=cmd_check)
+
+    p_list = sub.add_parser("list", help="列出已保存会话")
+    p_list.set_defaults(func=cmd_list)
+
+    p_rm = sub.add_parser("rm", help="删除会话")
+    p_rm.add_argument("name")
+    p_rm.set_defaults(func=cmd_rm)
+
+    args = ap.parse_args()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()

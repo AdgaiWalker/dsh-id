@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
-"""vault-guard — 不可逆操作审批（防误删/误付）
+"""dsh-id guard — 不可逆操作审批（防误删/误付）
 
 用法
 ----
-    vault-guard check "<操作描述>"      # AI 执行危险操作前调用
-    vault-guard pending                 # 列出待批准
-    vault-guard approve <id>            # 批准
-    vault-guard reject <id> [--note N]  # 拒绝
-    vault-guard status <id>             # 查某一项状态
-    vault-guard rules                   # 查看当前规则
+    dsh-id guard check "<操作描述>"      # AI 执行危险操作前调用
+    dsh-id guard pending                 # 列出待批准
+    dsh-id guard approve <id>            # 批准
+    dsh-id guard reject <id> [--note N]  # 拒绝
+    dsh-id guard status <id>             # 查某一项状态
+    dsh-id guard rules                   # 查看当前规则
 
 退出码（便于 AI 判断）
 ----
@@ -54,7 +54,7 @@ def cmd_check(args):
             print(f"  规则:    {rate['key']}  {rate['rule']}")
             print(f"  操作:    {action}")
             print()
-            print("  ⚠ 先别做。等一会儿、或换账号、或查清失败原因后 vault-guard reset")
+            print("  ⚠ 先别做。等一会儿、或换账号、或查清失败原因后 dsh-id guard reset")
             G._audit(action="guard_check", cred="-", host="-", path="-", status=11,
                      note="throttled %s: %s" % (rate["key"], rate["reason"]))
             sys.exit(EXIT_THROTTLE)
@@ -73,7 +73,7 @@ def cmd_check(args):
     print(f"  操作:    {action}")
     print()
     print("  ⚠ 这是不可逆/高风险操作，必须先获得老板批准。")
-    print(f"  请老板执行: vault-guard approve {r['id']}")
+    print(f"  请老板执行: dsh-id guard approve {r['id']}")
     print(f"  批准后再继续；被拒绝请放弃该操作。")
     G._audit(action="guard_check", cred="-", host="-", path="-",
              status=10,
@@ -172,7 +172,7 @@ def cmd_rules(args):
 
 def main():
     ap = argparse.ArgumentParser(
-        prog="vault-guard", description="不可逆操作审批")
+        prog="dsh-id guard", description="不可逆操作审批")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     p_check = sub.add_parser("check", help="检查操作是否需要批准（AI 调用）")

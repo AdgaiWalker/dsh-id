@@ -4,7 +4,7 @@
 看：凭据名/类型/白名单、网页会话/有效期、审计链状态。
 改：新增凭据、改白名单、删凭据、删会话、生成待吊销清单。
 
-绝不返回凭据值：明文只在 POST 进来的一瞬间交给 vault-cred（走 stdin），
+绝不返回凭据值：明文只在 POST 进来的一瞬间交给 dsh-id creds（走 stdin），
 不落盘、不回显、不进日志。
 """
 import argparse
@@ -27,8 +27,11 @@ PAGE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "panel.html")
 
 
 def _run(cmd, *args, stdin_data=None):
+    """cmd 可以是 "vault-cred" 这类入口名，也可以是 "creds add" 这种带子命令的串。"""
+    parts = cmd.split()
+    argv = [os.path.join(BIN, parts[0]), *parts[1:], *args]
     try:
-        r = subprocess.run([os.path.join(BIN, cmd), *args], input=stdin_data,
+        r = subprocess.run(argv, input=stdin_data,
                            capture_output=True, text=True, timeout=60)
         return r.returncode, (r.stdout or "") + (r.stderr or "")
     except Exception as exc:
@@ -153,11 +156,11 @@ def action(op, body, ctx=None):
             args += ["--holder", str(body.get("holder", "")).strip(),
                      "--expiry", str(body.get("expiry", "")).strip(),
                      "--billing", str(body.get("billing", "")).strip()]
-            rc, out = _run("vault-cred", *args, stdin_data=number + "\n" + cvv + "\n")
+            rc, out = _run("dsh-id creds", *args, stdin_data=number + "\n" + cvv + "\n")
         elif ctype == "totp":
-            rc, out = _run("vault-cred", *args, stdin_data=secret + "\n")
+            rc, out = _run("dsh-id creds", *args, stdin_data=secret + "\n")
         else:
-            rc, out = _run("vault-cred", *args, stdin_data=secret + "\n")
+            rc, out = _run("dsh-id creds", *args, stdin_data=secret + "\n")
         if rc != 0:
             return False, out.strip().splitlines()[-1] if out.strip() else "新增失败"
         V.audit_event(action="panel_cred_add", cred=name, host=domains.split(",")[0],
@@ -167,7 +170,7 @@ def action(op, body, ctx=None):
     if op == "cred_lease":
         name = str(body.get("name", "")).strip()
         days = int(body.get("days", 90))
-        rc, out = _run("vault-cred", "lease", name, "--days", str(days), "--reset")
+        rc, out = _run("dsh-id creds", "lease", name, "--days", str(days), "--reset")
         if rc != 0:
             return False, (out.strip().splitlines()[-1] if out.strip() else "设置失败")
         return True, out.strip().splitlines()[-1]
@@ -177,7 +180,7 @@ def action(op, body, ctx=None):
         secret = str(body.get("secret", ""))
         if not name or not secret:
             return False, "名字和新值都要填"
-        rc, out = _run("vault-cred", "rotate", name, stdin_data=secret + "\n")
+        rc, out = _run("dsh-id creds", "rotate", name, stdin_data=secret + "\n")
         if rc != 0:
             return False, (out.strip().splitlines()[-1] if out.strip() else "轮换失败")
         return True, f"已轮换 {name}"
@@ -222,12 +225,12 @@ def action(op, body, ctx=None):
 
     if op == "session_check":
         name = str(body.get("name", "")).strip()
-        rc, out = _run("vault-session", "check", name)
+        rc, out = _run("dsh-id session", "check", name)
         tail = " ".join(out.strip().splitlines()[-2:])[:200]
         return rc == 0, (tail or "已检查")
 
     if op == "cred_adopt":
-        rc, out = _run("vault-cred", "adopt")
+        rc, out = _run("dsh-id creds", "adopt")
         if rc != 0:
             return False, (out.strip().splitlines()[-1] if out.strip() else "归档失败")
         return True, "已把老格式密文登记进索引（密文未改动）"
@@ -254,20 +257,20 @@ def action(op, body, ctx=None):
         methods = _norm_domains(body.get("methods"))
         paths = _norm_domains(body.get("paths"))
         args = ["scope", name, "--methods", ",".join(methods), "--paths", ",".join(paths)]
-        rc, out = _run("vault-cred", *args)
+        rc, out = _run("dsh-id creds", *args)
         if rc != 0:
             return False, (out.strip().splitlines()[-1] if out.strip() else "设置失败")
         return True, out.strip().splitlines()[0]
 
     if op == "audit_anchor":
-        rc, out = _run("vault-cred", "audit-anchor")
+        rc, out = _run("dsh-id creds", "audit", "anchor")
         if rc != 0:
             return False, (out.strip().splitlines()[-1] if out.strip() else "导出失败")
         return True, out.strip().splitlines()[0]
 
     if op == "revoke_list":
         p = os.path.join(V._vault_dir(), "REVOKE.md")
-        rc, out = _run("vault-cred", "revoke-list", "--out", p)
+        rc, out = _run("dsh-id creds", "revoke-list", "--out", p)
         return rc == 0, (out.strip().splitlines()[0] if out.strip() else p)
 
     if op == "check_update":

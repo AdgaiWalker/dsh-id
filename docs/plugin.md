@@ -43,7 +43,7 @@
 - 不返回凭据值（凭据只走底层 `vault-exec`，不进参数/返回值/审计）
 - 不提供 approve/reject（审批必须由人在命令行执行，避免 AI 自批）
 - 截图不返回内容，只返回本地文件路径
-- 不启动/停止/重启 DSH 或任何常驻服务（`vault-proxy` 保持 disabled）
+- 不启动/停止/重启 DSH 或任何常驻服务（v0.3.0 起已无常驻代理；面板服务单独管理）
 - 不修改 vault 内容、不改密钥、不动浏览器 profile
 
 > 注：执行类工具**会** spawn 子进程（`vault-exec`/`vault-session`/`bstart`/`bctl`），

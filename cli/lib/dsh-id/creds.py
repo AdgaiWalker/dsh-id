@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
-"""vault-cred — 账号执行层凭据管理
+"""dsh-id creds — 账号执行层凭据管理
 
-⚠ vault-proxy 常驻服务已停用（stop + disable），勿再启用：
+⚠ v0.3.0 起没有常驻代理（vault-proxy 已删）：
   它监听 127.0.0.1:48771 且无调用方认证，同用户任意进程可用真实凭据。
-  日常调用请用 `vault-exec run|curl`（按需注入，用完即失效）。
+  日常调用请用 `dsh-id exec run|curl`（按需注入，用完即失效）。
   本工具的 add/list/rm/status/audit-verify 等管理命令不受影响。
 
 用法
 ----
-    vault-cred add <名字> <类型> --domains a.com,b.com [--header-name X-Api-Key] [--param-name api_key]
-    vault-cred list
-    vault-cred rm <名字>
-    vault-cred test <名字> <host> <路径>
+    dsh-id creds add <名字> <类型> --domains a.com,b.com [--header-name X-Api-Key] [--param-name api_key]
+    dsh-id creds list
+    dsh-id creds rm <名字>
+    dsh-id creds test <名字> <host> <路径>
 
 类型
 ----
@@ -52,7 +52,7 @@ def _read_secret(prompt):
 
 def _die(msg):
     """统一的用户级错误退出（exit 2），不要用 NameError 暴露内部状态。"""
-    print(f"vault-cred: {msg}", file=sys.stderr)
+    print(f"dsh-id creds: {msg}", file=sys.stderr)
     sys.exit(2)
 
 
@@ -162,78 +162,14 @@ def cmd_add(args):
         print(f"  查询参数: {meta['param_name']}")
     if ctype in V.NO_EXEC_TYPES:
         print("  这一类是第二因素种子：不能 exec、不发网络请求、没有租约")
-        print(f"  用法: vault-login <会话名> --url <登录页> --cred <账号密码凭据> --totp {name}")
+        print(f"  用法: dsh-id login <会话名> --url <登录页> --cred <账号密码凭据> --totp {name}")
         print("  提醒: 种子与密码同库，安全性不因此提高，提高的是自动化。")
     else:
-        print(f"  用法（推荐，按需注入）: vault-exec curl {name} https://<host>/<path>")
-        print(f"  给老格式凭据补作用域: vault-cred scope {name} --methods GET,POST --paths /repos/")
+        print(f"  用法（推荐，按需注入）: dsh-id exec curl {name} https://<host>/<path>")
+        print(f"  给老格式凭据补作用域: dsh-id creds scope {name} --methods GET,POST --paths /repos/")
 
 
 GITHUB_API = os.environ.get("DSH_ID_GITHUB_API", "https://api.github.com")
-
-
-def _b64u(raw):
-    import base64
-    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
-
-
-def _github_app_jwt(app_id, key_path):
-    """RS256 JWT（10 分钟上限；GitHub 要求 exp ≤ 10min）。用 openssl 签，免装 cryptography。"""
-    import subprocess as _sp
-    import time as _t
-    head = _b64u(json.dumps({"alg": "RS256", "typ": "JWT"}, separators=(",", ":")).encode())
-    payload = _b64u(json.dumps({"iat": int(_t.time()) - 60,
-                                "exp": int(_t.time()) + 540,
-                                "iss": str(app_id)}, separators=(",", ":")).encode())
-    signing_input = f"{head}.{payload}".encode()
-    r = _sp.run(["openssl", "dgst", "-sha256", "-sign", key_path],
-                input=signing_input, capture_output=True)
-    if r.returncode != 0:
-        raise SystemExit("openssl 签名失败: " + r.stderr.decode()[:200])
-    return f"{head}.{payload}.{_b64u(r.stdout)}"
-
-
-def cmd_mint(args):
-    """用 GitHub App 换 1 小时令牌，写进保险库（到期自动失效，不必长期保存 pat）。"""
-    if not os.path.exists(args.key):
-        _die(f"私钥不存在: {args.key}")
-    try:
-        jwt = _github_app_jwt(args.app_id, args.key)
-    except SystemExit as e:
-        _die(str(e))
-    url = f"{GITHUB_API}/app/installations/{args.installation}/access_tokens"
-    import urllib.request as _u
-    import urllib.error as _ue
-    req = _u.Request(url, method="POST", headers={
-        "Authorization": f"Bearer {jwt}", "Accept": "application/vnd.github+json",
-        "User-Agent": "dsh-id", "Content-Length": "0"})
-    try:
-        with _u.urlopen(req, timeout=15) as r:
-            body = json.load(r)
-    except _ue.HTTPError as e:
-        _die(f"GitHub 拒绝（HTTP {e.code}）: {e.read()[:200].decode(errors='replace')}")
-    except Exception as e:
-        _die(f"请求失败: {e}")
-    token = body.get("token")
-    if not token:
-        _die("GitHub 没返回 token")
-    name = args.name
-    # 覆盖写入：短时令牌，不需要租约（expires_at 由 GitHub 决定）
-    meta = {"name": name, "type": "bearer",
-            "domains": [d.strip() for d in args.domains.split(",") if d.strip()],
-            "created_at": int(__import__("time").time()), "lease_days": 0,
-            "minted": "github-app", "app_id": str(args.app_id),
-            "installation": str(args.installation),
-            "expires_at": body.get("expires_at")}
-    V.save_secret(name, token)
-    V.save_meta(meta)
-    V.app_log("mint", cred=name, provider="github-app", expires=body.get("expires_at"))
-    V.audit_event(action="mint", cred=name, host=meta["domains"][0] if meta["domains"] else "-",
-                  path="-", status=0, note="github-app token")
-    exp = body.get("expires_at", "?")
-    print(f"✓ 已签发 {name}（GitHub App 安装令牌，GitHub 侧到期: {exp}）")
-    print(f"  白名单: {', '.join(meta['domains'])}")
-    print(f"  用: dsh-id exec {name} https://api.github.com/user")
 
 
 def cmd_rotate(args):
@@ -242,7 +178,7 @@ def cmd_rotate(args):
     try:
         meta = V.load_meta(name)
     except V.VaultError:
-        _die(f"凭据不存在: {name}（新增用 vault-cred add）")
+        _die(f"凭据不存在: {name}（新增用 dsh-id creds add）")
     if meta.get("type") == "card":
         card = _read_card(args)
         V.save_secret(name, json.dumps({"number": card["number"], "cvv": card["cvv"]}))
@@ -347,6 +283,9 @@ def cmd_list(args):
 
 
 def cmd_rm(args):
+    if getattr(args, "revoke", False):
+        args.approval_id = None
+        return cmd_revoke(args)
     removed = V.remove_credential(args.name)
     if removed:
         print(f"✓ 已删除凭据 {args.name}（{len(removed)} 个文件）")
@@ -509,8 +448,7 @@ def cmd_panic(args):
 
     if args.dry_run:
         print("=== panic --dry-run（未做任何改动）===")
-        print(f"会停止服务:   {V.SERVICE}")
-        print(f"会禁用服务:   {V.SERVICE}（重启机器也不会自愈）")
+        print("会切断能力:   隔离全部密文（没有常驻代理可停）")
         print(f"会隔离密文:   {len(res['secrets'])} 个")
         for s in res["secrets"]:
             print(f"  - {s}")
@@ -524,7 +462,7 @@ def cmd_panic(args):
             print(f"⚠ 预览生成失败: {exc}")
         print()
         print("注意：vault.key 与元数据不会被删除，随时可恢复。")
-        print("确认执行请运行: vault-cred panic")
+        print("确认执行请运行: dsh-id creds panic")
         return
 
     V.app_log("panic", moved=len(res.get("moved") or []))
@@ -533,7 +471,7 @@ def cmd_panic(args):
         print("✓ 代理服务已停止（AI 立刻失去登录能力）")
     else:
         print(f"⚠ 服务停止失败: {res.get('service_error', '未知原因')}")
-        print(f"  请手动确认: systemctl --user status {V.SERVICE}")
+        print("  提醒: 已存的网页会话和上游 token 不受影响，用 revoke-list 看清单")
 
     if res.get("service_disabled"):
         print("✓ 服务已禁用（重启机器也不会自愈，必须人工恢复）")
@@ -556,7 +494,7 @@ def cmd_panic(args):
         print(f"⚠ 待吊销清单生成失败: {exc}")
 
     print()
-    print("恢复方法: vault-cred restore")
+    print("恢复方法: dsh-id creds restore")
     print("（会自动挪回密文、重新启用并启动服务、验证一次调用）")
     print()
     print("vault.key 未被动过，密文仍可解密，恢复后立即可用。")
@@ -575,8 +513,8 @@ def cmd_restore(args):
             names = ", ".join(f[:-len(".secret.enc")] for f in d["files"]) or "（空）"
             print(f"{d['stamp']:<20}{d['count']:<8}{names}")
         print()
-        print("恢复最新:   vault-cred restore")
-        print("恢复指定:   vault-cred restore <时间戳>")
+        print("恢复最新:   dsh-id creds restore")
+        print("恢复指定:   dsh-id creds restore <时间戳>")
         return
 
     res = V.restore(stamp=args.stamp)
@@ -605,7 +543,7 @@ def cmd_restore(args):
         print(f"⚠ 隔离目录未删（仍有 {len(left)} 项）: {', '.join(left) or '未知'}")
 
     if res["service_enabled"]:
-        print(f"✓ 服务已 enable --now: {V.SERVICE}")
+        print("✓ 密文已恢复到原位")
     else:
         print(f"⚠ 服务启动失败: {res.get('error', '未知原因')}")
 
@@ -653,7 +591,7 @@ def _guard_batch(action_desc):
     print(f"  命中: {', '.join(r['hits'])}")
     print(f"  待批准 id: {r['id']}")
     print()
-    print(f"  请老板执行: vault-guard approve {r['id']}")
+    print(f"  请老板执行: dsh-id guard approve {r['id']}")
     print(f"  批准后重新运行本命令，并加 --approval-id {r['id']}")
     sys.exit(10)
 
@@ -712,6 +650,21 @@ def cmd_revoke(args):
     print("  注意: 代理仍在运行，该凭据的密文已不在原位，无法再解密注入。")
 
 
+def _anchor_hint(status, detail):
+    if status == "ok":
+        return ["链条与锚一致；后面新写的行不会影响这条结论。"]
+    if status == "truncated":
+        return ["日志比锚短：有行被删掉了。锚是机外副本，它是准的。"]
+    return ["同样行数但链头不同：历史被重写过。别信这份日志，看锚。"]
+
+
+def cmd_audit(args):
+    act = args.action
+    if act == "anchor":
+        return cmd_anchor(args)
+    return cmd_audit_verify(args)
+
+
 def cmd_audit_verify(args):
     if getattr(args, "anchor", None):
         status, detail = V.verify_anchor(args.anchor)
@@ -753,7 +706,7 @@ def _ask_password(prompt="主密码: ", confirm=False):
 
 def cmd_init(args):
     if V.master_enabled():
-        sys.exit("主密码已设置过；改密码用 vault-cred passwd")
+        sys.exit("主密码已设置过；改密码用 dsh-id creds passwd")
     print("=== 设置主密码 ===")
     print("主密码用于解锁保险库。忘记它只能靠恢复码，请务必记牢。")
     print("（输入不回显）")
@@ -768,7 +721,7 @@ def cmd_init(args):
     print(f"✓ 自动锁定超时: {meta['timeout_minutes']} 分钟")
     print(f"✓ 当前已解锁")
     print()
-    print("下一步强烈建议: vault-cred recovery-codes")
+    print("下一步强烈建议: dsh-id creds recovery-codes")
     try:
         V.audit_event(action="master_init", cred="-", host="-", path="-", status=0,
                       note="timeout=%s" % meta["timeout_minutes"])
@@ -778,7 +731,7 @@ def cmd_init(args):
 
 def cmd_unlock(args):
     if not V.master_enabled():
-        sys.exit("尚未设置主密码，请先 vault-cred init")
+        sys.exit("尚未设置主密码，请先 dsh-id creds init")
     if not V.is_locked():
         ok, remain, _, _ = V.unlock_status()
         print(f"已经解锁（剩余 {remain // 60} 分钟）")
@@ -859,7 +812,7 @@ def cmd_status(args):
 
 def cmd_passwd(args):
     if not V.master_enabled():
-        sys.exit("尚未设置主密码，请先 vault-cred init")
+        sys.exit("尚未设置主密码，请先 dsh-id creds init")
     print("=== 修改主密码 ===")
     old = _ask_password("当前主密码: ")
     new = _ask_password("新主密码: ", confirm=True)
@@ -883,7 +836,7 @@ def cmd_timeout(args):
     if args.minutes is None:
         meta = V.load_master_meta()
         print(f"当前自动锁定超时: {meta['timeout_minutes']} 分钟")
-        print("修改: vault-cred timeout <分钟数>")
+        print("修改: dsh-id creds timeout <分钟数>")
         return
     if args.minutes < 1:
         sys.exit("超时至少 1 分钟")
@@ -898,7 +851,7 @@ def cmd_recovery_codes(args):
     if not V.master_enabled():
         sys.exit("请先设置主密码再生成恢复码")
     if V.is_locked():
-        sys.exit("保险库已锁定，请先 vault-cred unlock")
+        sys.exit("保险库已锁定，请先 dsh-id creds unlock")
     if V.recovery_available() and not args.force:
         info = V.recovery_info()
         sys.exit(f"恢复码已存在（{info['count']} 个，生成于 {info['created_at_str']}）。"
@@ -943,65 +896,6 @@ def cmd_recovery_reset(args):
         V.audit_event(action="recovery_reset", cred="-", host="-", path="-", status=0)
     except Exception:
         pass
-
-
-def cmd_audit_report(args):
-    r = V.audit_report()
-    print("=" * 66)
-    print(f"  保险库安全审计报告")
-    print("=" * 66)
-    print()
-    bar_len = 30
-    filled = int(round(bar_len * r["score"] / 100))
-    bar = "█" * filled + "░" * (bar_len - filled)
-    print(f"  健康分: {r['score']}/100  [{bar}]  {r['grade']}")
-    print()
-    print(f"  凭据 {r['counts']['credentials']} 个 · 会话 {r['counts']['sessions']} 个")
-    print(f"  高风险 {r['counts']['high']} · 中风险 {r['counts']['medium']} · 低风险 {r['counts']['low']}")
-    print(f"  主密码: {'已启用' if r['master_enabled'] else '未启用'}"
-          f" · 恢复码: {'已生成' if r['recovery_available'] else '未生成'}"
-          f" · 自动锁定: {r['timeout_minutes']} 分钟")
-    print()
-    if not r["findings"]:
-        print("  ✓ 没有发现风险项")
-    else:
-        print("  风险清单:")
-        order = {"high": 0, "medium": 1, "low": 2}
-        icon = {"high": "🔴", "medium": "🟡", "low": "🔵"}
-        for sev, cat, name, msg in sorted(r["findings"], key=lambda f: order[f[0]]):
-            print(f"    {icon[sev]} [{cat}] {name}: {msg}")
-    print()
-    print("=" * 66)
-
-
-def cmd_test(args):
-    url = f"{PROXY}/{args.name}/{args.host}/{args.path.lstrip('/')}"
-    req = urllib.request.Request(url, method="GET")
-    print(f"→ GET {url}")
-    try:
-        with urllib.request.urlopen(req, timeout=35) as r:
-            body = r.read()
-            print(f"← HTTP {r.status} {r.reason}")
-            ctype = r.headers.get("Content-Type", "")
-            print(f"  Content-Type: {ctype}")
-            text = body.decode("utf-8", "replace")
-            print("  响应前 400 字符:")
-            print(text[:400])
-    except urllib.error.HTTPError as e:
-        body = e.read().decode("utf-8", "replace")
-        print(f"← HTTP {e.code} {e.reason}")
-        print("  " + body[:400])
-        sys.exit(1)
-    except urllib.error.URLError as e:
-        sys.exit(f"连不上代理（服务没起？）: {e.reason}")
-
-
-def _anchor_hint(status, detail):
-    if status == "ok":
-        return ["链条与锚一致；后面新写的行不会影响这条结论。"]
-    if status == "truncated":
-        return ["日志比锚短：有行被删掉了。锚是机外副本，它是准的。"]
-    return ["同样行数但链头不同：历史被重写过。别信这份日志，看锚。"]
 
 
 def cmd_adopt(args):
@@ -1055,113 +949,14 @@ def cmd_anchor(args):
     print(f"✓ 锚已写出: {out}")
     print(f"  行数 {rec['rows']} · 链头 {rec['head'][:16]}… · 链状态 "
           f"{'ok' if rec['chain_ok'] else '异常'}")
-    print("  把这份文件放到机外（密码管理器/另一台机器）；核对：vault-cred audit-verify --anchor <文件>")
+    print("  把这份文件放到机外（密码管理器/另一台机器）；核对：dsh-id creds audit-verify --anchor <文件>")
 
 
-def main():
+def master_main(argv):
+    """`dsh-id vault …`：主密码与恢复码。默认不用它（机器绑定自动解锁）。"""
     ap = argparse.ArgumentParser(
-        prog="vault-cred", description="账号执行层凭据管理")
+        prog="dsh-id vault", description="保险库主密码与恢复（可选加强项）")
     sub = ap.add_subparsers(dest="cmd", required=True)
-
-    p_add = sub.add_parser("add", help="新增凭据（交互输入值，不回显）")
-    p_add.add_argument("name")
-    p_add.add_argument("type", choices=V.SUPPORTED_TYPES)
-    p_add.add_argument("--domains", default="",
-                       help="域名白名单，逗号分隔；支持 *.example.com（totp 不需要）")
-    p_add.add_argument("--header-name", dest="header_name",
-                       help="header 类型要注入的请求头名")
-    p_add.add_argument("--param-name", dest="param_name",
-                       help="query 类型要拼的查询参数名")
-    p_add.add_argument("--force", action="store_true", help="覆盖已存在的凭据")
-    p_add.add_argument("--holder", help="card：持卡人")
-    p_add.add_argument("--expiry", help="card：有效期 MM/YY")
-    p_add.add_argument("--billing", help="card：账单地址")
-    p_add.add_argument("--lease-days", type=int, default=V.LEASE_DEFAULT_DAYS,
-                       help=f"租约天数：到期后拒绝使用，必须先轮换（默认 {V.LEASE_DEFAULT_DAYS}，0=不设租约）")
-    p_add.set_defaults(func=cmd_add)
-
-    p_list = sub.add_parser("list", help="列出凭据（只显示名字/类型/域名）")
-    p_list.set_defaults(func=cmd_list)
-
-    p_rm = sub.add_parser("rm", help="删除凭据")
-    p_rm.add_argument("name")
-    p_rm.set_defaults(func=cmd_rm)
-
-    p_test = sub.add_parser("test", help="走代理测一次")
-    p_test.add_argument("name")
-    p_test.add_argument("host")
-    p_test.add_argument("path")
-    p_test.set_defaults(func=cmd_test)
-
-    p_panic = sub.add_parser("panic", help="一键吊销：停代理 + 禁用服务 + 隔离所有凭据密文")
-    p_panic.add_argument("--dry-run", dest="dry_run", action="store_true",
-                         help="只看会做什么，不真删")
-    p_panic.set_defaults(func=cmd_panic)
-
-    p_restore = sub.add_parser("restore", help="一条命令恢复：挪回密文 + 启用服务 + 验证")
-    p_restore.add_argument("stamp", nargs="?", default=None,
-                           help="指定要恢复的时间戳（默认恢复最新的）")
-    p_restore.add_argument("--list", action="store_true", dest="list",
-                           help="列出所有可恢复的隔离目录")
-    p_restore.set_defaults(func=cmd_restore)
-
-    p_revoke = sub.add_parser("revoke", help="吊销凭据（单个不拦；批量需审批）")
-    p_revoke.add_argument("name", nargs="?", help="要吊销的凭据名")
-    p_revoke.add_argument("names", nargs="*", help="（批量）多个凭据名")
-    p_revoke.add_argument("--all", action="store_true", help="吊销全部凭据（需审批）")
-    p_revoke.add_argument("--approval-id", dest="approval_id",
-                          help="vault-guard 批准后的 id")
-    p_revoke.set_defaults(func=cmd_revoke)
-
-    p_rl = sub.add_parser("revoke-list", help="生成待吊销清单：哪些 token/会话在平台上还没停")
-    p_rl.add_argument("--out", help="输出路径，默认 <vault>/REVOKE.md")
-    p_rl.set_defaults(func=cmd_revoke_list)
-
-    p_ls = sub.add_parser("lease", help="给已有凭据设/改租约（不换值）")
-    p_ls.add_argument("name")
-    p_ls.add_argument("--days", type=int, help="租约天数，0=取消租约")
-    p_ls.add_argument("--reset", action="store_true", help="从今天重新计时")
-    p_ls.set_defaults(func=cmd_lease)
-
-    p_mint = sub.add_parser("mint", help="用 GitHub App 签发短时令牌（1 小时，自动过期）")
-    p_mint.add_argument("name")
-    p_mint.add_argument("--app-id", required=True)
-    p_mint.add_argument("--installation", required=True)
-    p_mint.add_argument("--key", required=True, help="App 私钥 .pem 路径")
-    p_mint.add_argument("--domains", default="api.github.com")
-    p_mint.set_defaults(func=cmd_mint)
-
-    p_rot = sub.add_parser("rotate", help="轮换凭据值（身份/白名单不变，租约重新计时）")
-    p_rot.add_argument("name")
-    p_rot.add_argument("--lease-days", type=int, help="顺便改租约天数")
-    p_rot.add_argument("--force", action="store_true", help="totp 换种子要显式确认（等于换 2FA）")
-    p_rot.add_argument("--holder", help="card：持卡人")
-    p_rot.add_argument("--expiry", help="card：有效期 MM/YY")
-    p_rot.add_argument("--billing", help="card：账单地址")
-    p_rot.set_defaults(func=cmd_rotate)
-
-    p_verify = sub.add_parser("audit-verify", help="校验审计日志哈希链完整性（可对机外锚）")
-    p_verify.add_argument("--anchor", help="机外锚文件；给了就只比锚，不看整条链")
-    p_verify.add_argument("--file", help="指定审计文件（默认 ~/.deepseekbot/vault/audit.log）")
-    p_verify.set_defaults(func=cmd_audit_verify)
-
-    # ── 主密码 / 自动锁定 ──
-    p_adopt = sub.add_parser("adopt", help="把老格式裸密文登记进索引（只补元数据，不重新加密）")
-    p_adopt.add_argument("--dry-run", dest="dry_run", action="store_true", help="只看会做什么")
-    p_adopt.set_defaults(func=cmd_adopt)
-
-    p_scope = sub.add_parser("scope", help="给凭据收紧 HTTP 作用域（方法 + 路径前缀）")
-    p_scope.add_argument("name")
-    p_scope.add_argument("--methods", default=None,
-                         help="允许的方法，逗号分隔，如 GET,POST；给空串表示清空")
-    p_scope.add_argument("--paths", default=None,
-                         help="允许的路径前缀，逗号分隔，如 /repos/,/user")
-    p_scope.set_defaults(func=cmd_scope)
-
-    p_anchor = sub.add_parser("audit-anchor", help="导出审计链头到机外可核对的锚文件")
-    p_anchor.add_argument("--out", help="锚文件路径（默认 vault/audit-anchor.json）")
-    p_anchor.add_argument("--check", help="改为核对已有锚文件")
-    p_anchor.set_defaults(func=cmd_anchor)
 
     p_init = sub.add_parser("init", help="设置主密码（首次）")
     p_init.add_argument("--timeout", type=int, default=None,
@@ -1195,9 +990,103 @@ def main():
     p_rr = sub.add_parser("recovery-reset", help="用恢复码重置主密码")
     p_rr.set_defaults(func=cmd_recovery_reset)
 
-    # ── 安全审计 ──
-    p_ar = sub.add_parser("audit-report", help="安全审计报告（Watchtower 式）")
-    p_ar.set_defaults(func=cmd_audit_report)
+
+    args = ap.parse_args(argv)
+    args.func(args)
+
+
+def main():
+    argv = sys.argv[1:]
+    if "--vault" in argv:
+        return master_main([a for a in argv if a != "--vault"])
+    # 旧名字仍然可用：audit-verify / audit-anchor → audit verify|anchor
+    if argv and argv[0] == "audit-verify":
+        argv = ["audit", "verify"] + argv[1:]
+    elif argv and argv[0] == "audit-anchor":
+        argv = ["audit", "anchor"] + argv[1:]
+    ap = argparse.ArgumentParser(
+        prog="dsh-id creds", description="账号执行层凭据管理")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    p_add = sub.add_parser("add", help="新增凭据（交互输入值，不回显）")
+    p_add.add_argument("name")
+    p_add.add_argument("type", choices=V.SUPPORTED_TYPES)
+    p_add.add_argument("--domains", default="",
+                       help="域名白名单，逗号分隔；支持 *.example.com（totp 不需要）")
+    p_add.add_argument("--header-name", dest="header_name",
+                       help="header 类型要注入的请求头名")
+    p_add.add_argument("--param-name", dest="param_name",
+                       help="query 类型要拼的查询参数名")
+    p_add.add_argument("--force", action="store_true", help="覆盖已存在的凭据")
+    p_add.add_argument("--holder", help="card：持卡人")
+    p_add.add_argument("--expiry", help="card：有效期 MM/YY")
+    p_add.add_argument("--billing", help="card：账单地址")
+    p_add.add_argument("--lease-days", type=int, default=V.LEASE_DEFAULT_DAYS,
+                       help=f"租约天数：到期后拒绝使用，必须先轮换（默认 {V.LEASE_DEFAULT_DAYS}，0=不设租约）")
+    p_add.set_defaults(func=cmd_add)
+
+    p_list = sub.add_parser("list", help="列出凭据（只显示名字/类型/域名）")
+    p_list.set_defaults(func=cmd_list)
+
+    p_rm = sub.add_parser("rm", help="删除凭据（--revoke：吊销并检查上游未停的部分）")
+    p_rm.add_argument("name", nargs="?", help="凭据名")
+    p_rm.add_argument("names", nargs="*", help="（批量）多个凭据名")
+    p_rm.add_argument("--revoke", action="store_true", help="吊销语义：额外生成待吊销清单")
+    p_rm.add_argument("--all", action="store_true", help="吊销全部凭据（需审批）")
+    p_rm.add_argument("--approval-id", dest="approval_id", help="dsh-id guard 批准后的 id")
+    p_rm.set_defaults(func=cmd_rm, force=False)
+
+    p_panic = sub.add_parser("panic", help="一键吊销：停代理 + 禁用服务 + 隔离所有凭据密文")
+    p_panic.add_argument("--dry-run", dest="dry_run", action="store_true",
+                         help="只看会做什么，不真删")
+    p_panic.set_defaults(func=cmd_panic)
+
+    p_restore = sub.add_parser("restore", help="一条命令恢复：挪回密文 + 启用服务 + 验证")
+    p_restore.add_argument("stamp", nargs="?", default=None,
+                           help="指定要恢复的时间戳（默认恢复最新的）")
+    p_restore.add_argument("--list", action="store_true", dest="list",
+                           help="列出所有可恢复的隔离目录")
+    p_restore.set_defaults(func=cmd_restore)
+
+    p_rl = sub.add_parser("revoke-list", help="生成待吊销清单：哪些 token/会话在平台上还没停")
+    p_rl.add_argument("--out", help="输出路径，默认 <vault>/REVOKE.md")
+    p_rl.set_defaults(func=cmd_revoke_list)
+
+    p_ls = sub.add_parser("lease", help="给已有凭据设/改租约（不换值）")
+    p_ls.add_argument("name")
+    p_ls.add_argument("--days", type=int, help="租约天数，0=取消租约")
+    p_ls.add_argument("--reset", action="store_true", help="从今天重新计时")
+    p_ls.set_defaults(func=cmd_lease)
+
+    p_rot = sub.add_parser("rotate", help="轮换凭据值（身份/白名单不变，租约重新计时）")
+    p_rot.add_argument("name")
+    p_rot.add_argument("--lease-days", type=int, help="顺便改租约天数")
+    p_rot.add_argument("--force", action="store_true", help="totp 换种子要显式确认（等于换 2FA）")
+    p_rot.add_argument("--holder", help="card：持卡人")
+    p_rot.add_argument("--expiry", help="card：有效期 MM/YY")
+    p_rot.add_argument("--billing", help="card：账单地址")
+    p_rot.set_defaults(func=cmd_rotate)
+
+    p_audit = sub.add_parser("audit", help="审计：verify（校验哈希链）/ anchor（导出机外锚）")
+    p_audit.add_argument("action", nargs="?", default="verify", choices=["verify", "anchor"],
+                         help="verify=校验链（默认）；anchor=导出链头")
+    p_audit.add_argument("--file", help="verify：指定日志文件")
+    p_audit.add_argument("--anchor", help="verify：机外锚文件")
+    p_audit.add_argument("--out", help="anchor：输出路径")
+    p_audit.add_argument("--check", help="anchor：改为核对已有锚")
+    p_audit.set_defaults(func=cmd_audit)
+
+    p_adopt = sub.add_parser("adopt", help="把老格式裸密文登记进索引（只补元数据，不重新加密）")
+    p_adopt.add_argument("--dry-run", dest="dry_run", action="store_true", help="只看会做什么")
+    p_adopt.set_defaults(func=cmd_adopt)
+
+    p_scope = sub.add_parser("scope", help="给凭据收紧 HTTP 作用域（方法 + 路径前缀）")
+    p_scope.add_argument("name")
+    p_scope.add_argument("--methods", default=None,
+                         help="允许的方法，逗号分隔，如 GET,POST；给空串表示清空")
+    p_scope.add_argument("--paths", default=None,
+                         help="允许的路径前缀，逗号分隔，如 /repos/,/user")
+    p_scope.set_defaults(func=cmd_scope)
 
     args = ap.parse_args()
     args.func(args)

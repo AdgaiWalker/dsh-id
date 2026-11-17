@@ -2,6 +2,18 @@
 
 > **本包取代 dsh-account-vault，dsh-account-vault 不再维护。** 两者是同一份代码的改名与扩展，不是竞争包。
 
+## 0.3.0 — 2026-11-17
+
+**B 组：本地轻量化（不破三条不变量）**
+
+- 删 `vault-proxy`（318）、`accounts`（150）；`audit-report`、`mint`、`cmd_test` 一并移除。
+- 入口 9 → 5：PATH 上只留 `dsh-id`、`dsh-id-panel`，其余三个（`vault-exec`/`vault-session`/`vault-login`）是转发壳，保证 `~/.dsh/AGENTS.md` 里「走 vault-exec」不断。
+- 子命令 24 → 11（`add/list/rm/panic/restore/revoke-list/lease/rotate/audit/adopt/scope`）；主密码与恢复码 8 个收进 `dsh-id vault …`，代码保留（老板要求保留）。
+- `revoke` 并成 `rm --revoke`；`audit-verify`/`audit-anchor` 并成 `audit verify|anchor`（旧名仍可调用）。
+- 插件工具 13 → 8：删掉总览/账号列表/单账号/审批队列/审计链校验五个只读工具（对应 CLI 一条命令就能看）。
+- 代码 8,346 → 7,061 行（−1,285）；`lib/index.js` 1,307 → 698。
+- 测试：`test.sh` 13 步、`offline.mjs` 75、`npm test` 69，全过。
+
 ## 未发布
 
 **A 组：账号本优先**
