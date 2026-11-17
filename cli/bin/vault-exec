@@ -164,10 +164,16 @@ def _load(cred):
         sys.stderr.write(f"vault-exec: 凭据不存在: {cred}\n")
         raise SystemExit(EXIT_NO_CRED)
     if meta.get("type") in V.NO_EXEC_TYPES:
-        sys.stderr.write(
-            f"vault-exec: {cred} 是第二因素种子（totp），不能注入 HTTP。\n"
-            "  要算码用 vault-login / totp；把种子当 Bearer 发出去等于把它泄露。\n")
-        audit("exec_refused_totp", cred, note="totp_not_executable")
+        ctype = meta.get("type")
+        if ctype == "card":
+            sys.stderr.write(
+                f"vault-exec: {cred} 是卡片信息（card），不是网络凭据——卡号/CVV 不能注入 HTTP 请求。\n"
+                "  要查卡面信息用面板或 dsh-id creds list（只显示尾号）。\n")
+        else:
+            sys.stderr.write(
+                f"vault-exec: {cred} 是第二因素种子（totp），不能注入 HTTP。\n"
+                "  要算码用 dsh-id login 或面板的本机出码；把种子当 Bearer 发出去等于把它泄露。\n")
+        audit("exec_refused_" + str(ctype), cred, note=str(ctype) + "_not_executable")
         raise SystemExit(EXIT_BAD_TYPE)
     _lease, _left = V.lease_state(meta)
     if _lease == "expired":
