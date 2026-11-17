@@ -122,4 +122,32 @@ set +e; out="$(vault-cred audit-verify --anchor "$ANCHOR" 2>&1)"; c=$?; set -e
 [ "$c" = "1" ] && echo "   ✓ 改一行后锚报不一致 → exit 1" || { echo "   ✗ 改了还报一致: $out"; exit 1; }
 
 echo
+echo "12) card 类型（卡号/CVV 加密，不能 exec）"
+printf '4242424242424242\n123\n' | vault-cred add cardtest card --holder "ZHANG SAN" --expiry 12/28 >/dev/null
+vault-cred list | grep -q "尾号 4242" && echo "   ✓ 列表只显示尾号" || { echo "   ✗ 列表没有卡摘要"; exit 1; }
+vault-cred list | grep -q "4242424242424242" && { echo "   ✗ 完整卡号出现在列表里"; exit 1; } || echo "   ✓ 列表不含完整卡号"
+set +e; vault-exec curl cardtest https://example.com >/dev/null 2>&1; c=$?; set -e
+[ "$c" = "6" ] && echo "   ✓ card 不能 exec → exit 6" || { echo "   ✗ card 竟能 exec exit=$c"; exit 1; }
+printf '5555555555554444\n456\n' | vault-cred rotate cardtest --holder "LI SI" --expiry 01/29 >/dev/null
+vault-cred list | grep -q "尾号 4444" && echo "   ✓ 换卡后尾号更新" || { echo "   ✗ 换卡没生效"; exit 1; }
+
+echo
+echo "13) 面板：加 totp / 本机才出码"
+PORT_PANEL=18944
+dsh-id-panel --port $PORT_PANEL >/dev/null 2>&1 & PANELP=$!
+sleep 1.2
+H=(-H "X-DSH-ID: dsh-id-panel" -H "Content-Type: application/json" -H "Origin: http://127.0.0.1:$PORT_PANEL")
+B="http://127.0.0.1:$PORT_PANEL/api/action"
+r=$(curl -s "${H[@]}" -d '{"op":"cred_add","name":"seed1","type":"totp","secret":"JBSWY3DPEHPK3PXP"}' $B)
+echo "$r" | grep -q '"ok": true' && echo "   ✓ 面板能加 totp（不需要白名单）" || { echo "   ✗ 加 totp 失败: $r"; exit 1; }
+r=$(curl -s "${H[@]}" -d '{"op":"cred_totp","name":"seed1"}' $B)
+echo "$r" | grep -qE '"code": "[0-9]{6}"' && echo "   ✓ 本机直连能出码" || { echo "   ✗ 本机出码失败: $r"; exit 1; }
+for hdr in "CF-Connecting-IP: 1.2.3.4" "X-Forwarded-For: 1.2.3.4"; do
+  c=$(curl -s -o /dev/null -w "%{http_code}" "${H[@]}" -H "$hdr" -d '{"op":"cred_totp","name":"seed1"}' $B)
+  [ "$c" = "403" ] && echo "   ✓ 带 ${hdr%%:*} → 403" || { echo "   ✗ ${hdr} 没挡住: $c"; exit 1; }
+done
+grep -q "panel_totp_denied" "$HOME/.deepseekbot/vault/audit.log" && echo "   ✓ 拒绝有审计" || { echo "   ✗ 拒绝没记审计"; exit 1; }
+kill $PANELP 2>/dev/null || true
+
+echo
 echo "全部通过"

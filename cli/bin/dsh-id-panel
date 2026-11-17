@@ -21,7 +21,7 @@ sys.path.insert(0, os.path.expanduser("~/.local/lib"))
 import vaultlib as V  # noqa: E402
 
 BIN = os.path.expanduser("~/.local/bin")
-TYPES = ("bearer", "basic", "header", "query")
+TYPES = ("bearer", "basic", "header", "query", "totp", "card")
 TOKEN = "dsh-id-panel"          # 自定义请求头，挡住浏览器跨站简单请求
 PAGE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "panel.html")
 
@@ -58,9 +58,10 @@ def state():
             "methods": sc["methods"],
             "paths": sc["paths"],
             "legacy": bool(m.get("legacy_file")),
+            "card": V.card_summary(m) if m.get("type") == "card" else None,
         }
         creds.append(item)
-        if item["type"] in V.NO_EXEC_TYPES:
+        if item["type"] == "totp":
             lu = V.last_used(item["name"], actions=("login", "totp")) or {}
             factors.append({"name": item["name"], "type": item["type"],
                             "site": (item["domains"] or ["-"])[0],
@@ -120,15 +121,19 @@ def state():
             "vault": V._vault_dir(), "types": list(TYPES)}
 
 
-def action(op, body):
+def action(op, body, ctx=None):
     """返回 (ok, 说明)。所有写操作走现有 CLI，不重写加密逻辑。"""
     if op == "cred_add":
         name = str(body.get("name", "")).strip()
         ctype = str(body.get("type", "")).strip()
         secret = str(body.get("secret", ""))
         domains = ",".join(_norm_domains(body.get("domains")))
-        if not name or not secret or not domains or ctype not in TYPES:
-            return False, "名字/类型/白名单/值 都要填"
+        if not name or ctype not in TYPES:
+            return False, "名字和类型要填"
+        if ctype not in V.NO_EXEC_TYPES and (not secret or not domains):
+            return False, "HTTP 类凭据：白名单和值都要填"
+        if ctype == "totp" and not secret:
+            return False, "TOTP 要填 base32 种子"
         args = ["add", name, ctype, "--domains", domains]
         if ctype == "header":
             hn = str(body.get("header_name", "")).strip()
@@ -140,7 +145,19 @@ def action(op, body):
             if not pn:
                 return False, "query 类型要填参数名"
             args += ["--param-name", pn]
-        rc, out = _run("vault-cred", *args, stdin_data=secret + "\n")
+        if ctype == "card":
+            number = str(body.get("card_number", "")).strip()
+            cvv = str(body.get("cvv", "")).strip()
+            if not number or not cvv:
+                return False, "卡号与 CVV 都要填"
+            args += ["--holder", str(body.get("holder", "")).strip(),
+                     "--expiry", str(body.get("expiry", "")).strip(),
+                     "--billing", str(body.get("billing", "")).strip()]
+            rc, out = _run("vault-cred", *args, stdin_data=number + "\n" + cvv + "\n")
+        elif ctype == "totp":
+            rc, out = _run("vault-cred", *args, stdin_data=secret + "\n")
+        else:
+            rc, out = _run("vault-cred", *args, stdin_data=secret + "\n")
         if rc != 0:
             return False, out.strip().splitlines()[-1] if out.strip() else "新增失败"
         V.audit_event(action="panel_cred_add", cred=name, host=domains.split(",")[0],
@@ -214,6 +231,21 @@ def action(op, body):
         if rc != 0:
             return False, (out.strip().splitlines()[-1] if out.strip() else "归档失败")
         return True, "已把老格式密文登记进索引（密文未改动）"
+
+    if op == "cred_totp":
+        name = str(body.get("name", "")).strip()
+        try:
+            meta = V.load_meta(name)
+        except V.VaultError:
+            return False, "凭据不存在"
+        if meta.get("type") not in V.NO_EXEC_TYPES or meta.get("type") != "totp":
+            return False, "这不是 TOTP 种子"
+        seed = V.load_secret(name)
+        code = V.totp_code(seed)
+        seed = None
+        V.audit_event(action="panel_totp", cred=name, host="127.0.0.1", path="-",
+                      status=200, note="code_issued_local")
+        return True, {"name": name, "code": code, "left": V.totp_lifetime(), "period": 30}
 
     if op == "cred_scope":
         name = str(body.get("name", "")).strip()
@@ -305,6 +337,22 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(raw)
 
+    def _local_only(self):
+        """出码只给本机直连。
+
+        经 testsite/cloudflared 反代时 Host 会被改写成 127.0.0.1:<port>，
+        所以不能只信 Host：公网请求一定带 CF-Connecting-IP 或 X-Forwarded-For。
+        三个条件全满足才放行：Host 是回环、两个代理头都不存在。
+        """
+        host = (self.headers.get("Host") or "").rsplit(":", 1)[0].strip().lower()
+        if host not in ("127.0.0.1", "localhost", "::1"):
+            return False, "host=" + (host or "-")
+        if self.headers.get("CF-Connecting-IP"):
+            return False, "cf-connecting-ip"
+        if self.headers.get("X-Forwarded-For"):
+            return False, "x-forwarded-for"
+        return True, ""
+
     def _origin_ok(self):
         """同源即可：经隧道/反代访问时 Origin 是 https://<公网 host>，Host 也是它。
         跨站（含恶意页面）Origin 的 host 与 Host 不同 → 拒绝。"""
@@ -351,8 +399,22 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             return self._send(400, json.dumps({"error": "bad json"}, ensure_ascii=False))
         op = str(body.pop("op", ""))
+        ctx = {"host": self.headers.get("Host") or ""}
+        if op == "cred_totp":
+            allowed, why = self._local_only()
+            if not allowed:
+                try:
+                    V.audit_event(action="panel_totp_denied",
+                                  cred=str(body.get("name") or "-"),
+                                  host=ctx["host"] or "-", path="-", status=403,
+                                  note="denied=" + why)
+                except Exception:
+                    pass
+                return self._send(403, json.dumps(
+                    {"ok": False, "message": "TOTP 出码只允许本机直连（公网入口拒绝）"},
+                    ensure_ascii=False))
         try:
-            ok, msg = action(op, body)
+            ok, msg = action(op, body, ctx)
         except Exception as exc:
             ok, msg = False, f"服务端错误: {exc}"
         try:

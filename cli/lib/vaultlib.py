@@ -100,8 +100,10 @@ CREDNAME_RE = re.compile(r"^[a-zA-Z0-9._-]{1,64}$")
 #   - 它不能注入 HTTP（种子一旦被当成 Bearer 发出去就是灾难）
 #   - 它不受租约约束（"作废"一个种子等于把账号锁死，而不是轮换）
 HTTP_TYPES = ("bearer", "basic", "header", "query")
-NO_EXEC_TYPES = ("totp",)
-NO_LEASE_TYPES = ("totp",)
+# card：多字段（卡号/CVV 加密，其余进 meta 供列表显示）。它是"信息"不是"凭据出口"，
+# 不能注入 HTTP，也不受过期租约约束（卡过期是银行的事，不是我们作废它）。
+NO_EXEC_TYPES = ("totp", "card")
+NO_LEASE_TYPES = ("totp", "card")
 SUPPORTED_TYPES = HTTP_TYPES + NO_EXEC_TYPES
 
 
@@ -847,6 +849,41 @@ def audit_report():
 
 
 # ── 域名白名单 ──────────────────────────────────────────────────────────────
+
+def totp_code(seed, digits=6, period=30, offset=0):
+    """RFC 6238 TOTP（SHA1）。offset 是时间步偏移，用来补偿 ±1 步时钟漂移。"""
+    import base64 as _b64
+    import hmac as _hmac
+    import hashlib as _hashlib
+    import struct as _struct
+    s = str(seed).replace(" ", "").replace("-", "").upper()
+    s += "=" * (-len(s) % 8)
+    try:
+        key = _b64.b32decode(s, casefold=True)
+    except Exception:
+        raise VaultError("bad_totp", "TOTP 种子不是合法 base32")
+    counter = int(time.time()) // period + int(offset)
+    digest = _hmac.new(key, _struct.pack(">Q", counter), _hashlib.sha1).digest()
+    off = digest[-1] & 0x0F
+    code = (_struct.unpack(">I", digest[off:off + 4])[0] & 0x7FFFFFFF) % (10 ** digits)
+    return f"{code:0{digits}d}"
+
+
+def totp_lifetime(period=30):
+    """当前码还剩几秒（面板倒计时用）。"""
+    return int(period - (time.time() % period))
+
+
+def card_summary(meta):
+    """卡的面板摘要：只给尾号/品牌/有效期/持卡人，绝不含卡号与 CVV。"""
+    return {
+        "last4": meta.get("last4") or "",
+        "brand": meta.get("brand") or "",
+        "expiry": meta.get("expiry") or "",
+        "holder": meta.get("holder") or "",
+        "billing": meta.get("billing") or "",
+    }
+
 
 def host_matches_allowlist(host: str, allowlist) -> bool:
     """移植自 agent-id access.mjs hostMatchesAllowlist。

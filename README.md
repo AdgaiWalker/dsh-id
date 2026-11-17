@@ -152,6 +152,32 @@ totp 是独立一类：**不能 exec、不发网络请求、没有租约**（作
 登录有失败熔断：TOTP 允许 1 次 ±1 时间步的时钟补偿，被拒即停并熔断该账号（连错 2 次不再试），
 避免撞平台风控或锁号。
 
+## 银行卡（card）
+
+```bash
+# 交互：卡号、CVV 不回显；有效期/持卡人/账单地址照填
+dsh-id creds add 招行visa card
+
+# 非交互（脚本/测试）：stdin 前两行是卡号、CVV，其余走参数
+printf '4242424242424242\n123\n' | dsh-id creds add visa card \
+  --holder "ZHANG SAN" --expiry 12/28 --billing "1 Main St"
+```
+
+card 是独立一类，**不能 exec、没有租约**：卡号与 CVV 在密文里（JSON 两字段），
+有效期/持卡人/账单地址/尾号/品牌进 meta 供列表显示。面板永远只显示尾号，
+`creds list` 不打印完整卡号。
+
+## 面板里出 TOTP 码（只限本机）
+
+面板的「出码」按钮只接受**本机直连**。判据三条同时满足才给码：
+
+1. `Host` 是 `127.0.0.1` / `localhost` / `::1`；
+2. 没有 `CF-Connecting-IP`；
+3. 没有 `X-Forwarded-For`。
+
+只查 Host 不够：经 testsite/cloudflared 反代进来时 Host 会被改写成 `127.0.0.1:<port>`，
+所以必须靠两个代理头判断。拒绝时返回 403 并写一条 `panel_totp_denied` 审计（记原因，不记码）。
+
 ## 作用域：域名之外，还管「能做什么」
 
 域名白名单只回答「能发给谁」。拿到 `github-pat` 仍然可以 `-X DELETE /repos/...`：

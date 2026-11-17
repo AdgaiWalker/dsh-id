@@ -56,6 +56,45 @@ def _die(msg):
     sys.exit(2)
 
 
+CARD_BRANDS = (("4", "Visa"), ("34", "Amex"), ("37", "Amex"), ("5", "Mastercard"),
+               ("2", "Mastercard"), ("62", "UnionPay"), ("35", "JCB"), ("6011", "Discover"))
+
+
+def _read_card(args):
+    """读卡片字段。卡号与 CVV 只走 stdin/getpass：不进 argv、不回显。
+
+    非交互（脚本/测试）：stdin 前两行分别是卡号、CVV，`--holder/--expiry/--billing` 给其余字段。
+    交互：逐个提示。
+    """
+    interactive = sys.stdin.isatty()
+    if interactive:
+        number = _read_secret("卡号（不回显）: ")
+        expiry = input("有效期（MM/YY）: ").strip()
+        holder = input("持卡人: ").strip()
+        billing = input("账单地址（可空）: ").strip()
+        cvv = _read_secret("CVV（不回显）: ")
+    else:
+        lines = [x.strip() for x in sys.stdin.read().splitlines() if x.strip()]
+        if len(lines) < 2:
+            _die("非交互模式：stdin 先给卡号，再给 CVV（两行）")
+        number, cvv = lines[0], lines[1]
+        expiry = (getattr(args, "expiry", None) or "").strip()
+        holder = (getattr(args, "holder", None) or "").strip()
+        billing = (getattr(args, "billing", None) or "").strip()
+
+    digits = "".join(ch for ch in number if ch.isdigit())
+    if not (12 <= len(digits) <= 19):
+        _die("卡号位数不对（12–19 位数字）")
+    if not (cvv.isdigit() and 3 <= len(cvv) <= 4):
+        _die("CVV 应为 3–4 位数字")
+    import re as _re
+    if not _re.fullmatch(r"(0[1-9]|1[0-2])/\d{2}", expiry or ""):
+        _die("有效期格式应为 MM/YY，例如 12/28")
+    brand = next((b for pre, b in CARD_BRANDS if digits.startswith(pre)), "")
+    return {"number": digits, "cvv": cvv, "expiry": expiry, "holder": holder,
+            "billing": billing, "last4": digits[-4:], "brand": brand}
+
+
 def cmd_add(args):
     name = args.name
     ctype = args.type
@@ -92,6 +131,18 @@ def cmd_add(args):
 
     if V.meta_exists(name) and not args.force:
         sys.exit(f"凭据 {name} 已存在；要覆盖请加 --force")
+
+    if ctype == "card":
+        card = _read_card(args)
+        meta.update({k: card[k] for k in ("last4", "brand", "expiry", "holder", "billing")})
+        V.save_secret(name, json.dumps({"number": card["number"], "cvv": card["cvv"]}))
+        V.save_meta(meta)
+        card = None
+        print(f"✓ 已保存卡片 {name}（{meta['brand'] or '卡'} 尾号 {meta['last4']}）")
+        print(f"  有效期: {meta['expiry']} · 持卡人: {meta['holder'] or '-'}")
+        print("  卡号与 CVV 在密文里；面板只显示尾号，任何时候都不回显完整卡号")
+        print("  这一类不能 exec、没有租约")
+        return
 
     hint = "输入凭据值（不回显）: " if ctype != "basic" else "输入 user:pass（不回显）: "
     value = _read_secret(hint)
@@ -192,6 +243,18 @@ def cmd_rotate(args):
         meta = V.load_meta(name)
     except V.VaultError:
         _die(f"凭据不存在: {name}（新增用 vault-cred add）")
+    if meta.get("type") == "card":
+        card = _read_card(args)
+        V.save_secret(name, json.dumps({"number": card["number"], "cvv": card["cvv"]}))
+        for k in ("last4", "brand", "expiry", "holder", "billing"):
+            meta[k] = card[k]
+        card = None
+        meta["rotated_at"] = int(__import__("time").time())
+        V.save_meta(meta)
+        V.audit_event(action="rotate", cred=name, host="-", path="-", status=0, note="card")
+        print(f"✓ 已更新卡片 {name}（尾号 {meta['last4']}）")
+        return
+
     if meta.get("type") in V.NO_EXEC_TYPES:
         print("提醒：这是第二因素种子。换掉它等于更换 2FA，必须同时在平台上重新绑定，")
         print("      否则这个账号会立刻登不进去。继续请重跑并加 --force。")
@@ -250,11 +313,15 @@ def cmd_list(args):
     if not creds:
         print("（无凭据）")
         return
-    print(f"{'名字':<22}{'类型':<10}{'域名白名单':<30}{'租约':<12}{'作用域'}")
-    print("-" * 92)
+    print(f"{'名字':<22}{'类型':<8}{'摘要':<44}{'租约':<10}{'作用域'}")
+    print("-" * 100)
     for c in creds:
         ctype = c.get("type", "?")
-        if ctype in V.NO_EXEC_TYPES:
+        if ctype == "card":
+            cs = V.card_summary(c)
+            domains = "尾号 %s · %s · %s · %s" % (cs["last4"] or "----", cs["brand"] or "-",
+                                                  cs["expiry"] or "-", cs["holder"] or "-")
+        elif ctype in V.NO_EXEC_TYPES:
             domains = "（第二因素 · 不发网络请求）"
         else:
             domains = ", ".join(c.get("domains") or []) or "（空 · 全部拒绝）"
@@ -267,13 +334,16 @@ def cmd_list(args):
             tail = f"已过期 {abs(left)} 天"
         else:
             tail = "无租约"
-        sc = V.scope_of(c)
-        scope = "未收紧"
-        if sc["methods"] or sc["paths"]:
-            scope = "%s %s" % (",".join(sc["methods"]) or "*", ",".join(sc["paths"]) or "*")
+        if ctype in V.NO_EXEC_TYPES:
+            scope = "不适用"
+        else:
+            sc = V.scope_of(c)
+            scope = "未收紧"
+            if sc["methods"] or sc["paths"]:
+                scope = "%s %s" % (",".join(sc["methods"]) or "*", ",".join(sc["paths"]) or "*")
         if c.get("legacy_file"):
             scope += " · 归档"
-        print(f"{c.get('name', '?'):<22}{ctype:<10}{domains:<30}{tail:<12}{scope}")
+        print(f"{c.get('name', '?'):<22}{ctype:<8}{domains[:42]:<44}{tail:<10}{scope}")
 
 
 def cmd_rm(args):
@@ -1003,6 +1073,9 @@ def main():
     p_add.add_argument("--param-name", dest="param_name",
                        help="query 类型要拼的查询参数名")
     p_add.add_argument("--force", action="store_true", help="覆盖已存在的凭据")
+    p_add.add_argument("--holder", help="card：持卡人")
+    p_add.add_argument("--expiry", help="card：有效期 MM/YY")
+    p_add.add_argument("--billing", help="card：账单地址")
     p_add.add_argument("--lease-days", type=int, default=V.LEASE_DEFAULT_DAYS,
                        help=f"租约天数：到期后拒绝使用，必须先轮换（默认 {V.LEASE_DEFAULT_DAYS}，0=不设租约）")
     p_add.set_defaults(func=cmd_add)
@@ -1062,6 +1135,9 @@ def main():
     p_rot.add_argument("name")
     p_rot.add_argument("--lease-days", type=int, help="顺便改租约天数")
     p_rot.add_argument("--force", action="store_true", help="totp 换种子要显式确认（等于换 2FA）")
+    p_rot.add_argument("--holder", help="card：持卡人")
+    p_rot.add_argument("--expiry", help="card：有效期 MM/YY")
+    p_rot.add_argument("--billing", help="card：账单地址")
     p_rot.set_defaults(func=cmd_rotate)
 
     p_verify = sub.add_parser("audit-verify", help="校验审计日志哈希链完整性（可对机外锚）")

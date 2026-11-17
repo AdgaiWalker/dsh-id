@@ -33,6 +33,10 @@
   .hint{color:var(--ink2);font-size:12px;padding:0 14px 10px}
   .pill{display:inline-block;font-size:11px;padding:1px 7px;border-radius:99px;border:1px solid var(--line);color:var(--ink2)}
   .ok{color:var(--accent)} .bad{color:var(--danger)} .unknown{color:var(--warn)}
+  .codecard{margin:12px 14px;padding:10px 12px;border:1px solid var(--line);border-radius:10px;background:#fbfdfb}
+  .codelabel{font-size:12px;color:var(--ink2)}
+  .codeval{font:600 30px/1.3 ui-monospace,SFMono-Regular,Menlo,monospace;letter-spacing:4px;color:var(--accent)}
+  .codeleft{font-size:12px;color:var(--ink2)}
   #toast{position:fixed;left:50%;bottom:18px;transform:translateX(-50%);background:#111;color:#fff;padding:9px 14px;border-radius:8px;font-size:13px;opacity:0;transition:.2s;pointer-events:none;max-width:90vw}
   #toast.show{opacity:.95}
   @media (max-width:520px){
@@ -72,10 +76,16 @@
         <option value="header">header（自定义头）</option>
         <option value="query">query（拼查询参数）</option>
         <option value="totp">totp（第二因素种子 · 不能 exec · 无租约）</option>
+        <option value="card">card（银行卡 · 卡号/CVV 加密，其余进列表）</option>
       </select>
-      <input name="domains" class="full" placeholder="域名白名单，逗号分隔，如 api.github.com,*.example.com" required>
-      <input name="header_name" placeholder="header 类型的请求头名（可选）">
-      <input name="param_name" placeholder="query 类型的参数名（可选）">
+      <input name="domains" class="full httpfield" placeholder="域名白名单，逗号分隔，如 api.github.com,*.example.com" required>
+      <input name="header_name" class="httpfield" placeholder="header 类型的请求头名（可选）">
+      <input name="param_name" class="httpfield" placeholder="query 类型的参数名（可选）">
+      <input name="card_number" class="full cardfield" type="password" placeholder="卡号（不回显，只提交一次）" autocomplete="off">
+      <input name="cvv" class="cardfield" type="password" placeholder="CVV（不回显）" autocomplete="off">
+      <input name="holder" class="cardfield" placeholder="持卡人">
+      <input name="expiry" class="cardfield" placeholder="有效期 MM/YY">
+      <input name="billing" class="full cardfield" placeholder="账单地址（可空）">
       <input name="secret" class="full" type="password" placeholder="凭据值（只提交一次，不回显）" autocomplete="new-password" required>
       <div class="full row-actions"><button class="primary" type="submit">新增凭据</button></div>
     </form>
@@ -83,6 +93,7 @@
 
   <section>
     <h2>第二因素 <span class="count" id="facCount"></span></h2>
+    <div id="codebox"></div>
     <div id="factors"></div>
     <div class="hint">种子永不回显、不能注入 HTTP、没有租约。它和密码同库，安全性不因此提高，提高的是自动化。</div>
   </section>
@@ -168,26 +179,30 @@ async function load() {
   const leaseText = (c) => c.lease_state === "none" ? "无租约"
     : c.lease_state === "expired" ? `已过期 ${Math.abs(c.days_left)} 天` : `剩 ${c.days_left} 天`;
   function scopeCell(c) {
-    if (c.type === "totp") return '<span class="domains">不适用</span>';
+    if (c.type === "totp" || c.type === "card") return '<span class="domains">不适用</span>';
     const m = (c.methods || []).join(","), pth = (c.paths || []).join(",");
     if (!m && !pth) return '<span class="bad">未收紧</span>';
     return `<span class="domains mono">${esc(m || "*")} ${esc(pth || "*")}</span>`;
   }
   function actionCell(c) {
     const btns = [];
-    if (c.type !== "totp") {
+    if (c.type === "totp") {
+      btns.push(`<button class="primary" onclick="showCode('${esc(c.name)}')">出码</button>`);
+      btns.push(`<button onclick="rotate('${esc(c.name)}')">换种子</button>`);
+    } else if (c.type === "card") {
+      btns.push(`<button onclick="rotate('${esc(c.name)}')">换卡</button>`);
+    } else {
       btns.push(`<button onclick="rotate('${esc(c.name)}')">轮换</button>`);
       btns.push(`<button onclick="setLease('${esc(c.name)}', ${c.lease || 0})">设租约</button>`);
       btns.push(`<button onclick="editScope('${esc(c.name)}','${esc((c.methods||[]).join(","))}','${esc((c.paths||[]).join(","))}')">设作用域</button>`);
-    } else {
-      btns.push(`<button onclick="rotate('${esc(c.name)}')">换种子</button>`);
+      btns.push(`<button onclick="editDomains('${esc(c.name)}','${esc(c.domains.join(","))}')">改白名单</button>`);
     }
-    btns.push(`<button onclick="editDomains('${esc(c.name)}','${esc(c.domains.join(","))}')">改白名单</button>`);
     btns.push(`<button class="danger" onclick="rmCred('${esc(c.name)}')">删除</button>`);
     return `<div class="row-actions">${btns.join("")}</div>`;
   }
   $("#creds").innerHTML = table(["名字", "类型", "白名单", "租约", "作用域", "操作"], s.creds.map(c => {
-    const head = `<span class="mono">${esc(c.name)}</span><div class="subline">${esc(c.type)} · ${esc(c.domains.join(", ") || "—")} · ${leaseText(c)}</div>`;
+    const cardTxt = c.card ? `尾号 ${esc(c.card.last4 || "----")} · ${esc(c.card.brand || "-")} · ${esc(c.card.expiry || "-")} · ${esc(c.card.holder || "-")}` : "";
+    const head = `<span class="mono">${esc(c.name)}</span><div class="subline">${esc(c.type)} · ${esc(cardTxt || c.domains.join(", ") || "—")} · ${leaseText(c)}</div>`;
     return [head,
       {html: esc(c.type), cls: "dup"},
       {html: esc(c.domains.join(", ") || "—"), cls: "dup"},
@@ -237,6 +252,40 @@ async function setLease(name, cur) {
   if (v === null) return;
   await post({op: "cred_lease", name, days: parseInt(v, 10) || 0});
 }
+let codeTimer = null;
+async function showCode(name) {
+  const r = await fetch("./api/action", {method: "POST", headers: H,
+    body: JSON.stringify({op: "cred_totp", name})});
+  const j = await r.json().catch(() => ({ok: false, message: "响应不是 JSON"}));
+  if (!j.ok) { toast(j.message || "取码失败", true); return; }
+  const d = j.message;
+  let left = d.left;
+  const box = $("#codebox");
+  const paint = () => {
+    box.innerHTML = `<div class="codecard"><div class="codelabel">${esc(d.name)} · 本机出码</div>
+      <div class="codeval">${esc(d.code.slice(0,3))} ${esc(d.code.slice(3))}</div>
+      <div class="codeleft">${left} 秒后换码${left <= 0 ? "（已过期，再点一次）" : ""}</div></div>`;
+    left -= 1;
+    if (left < -1) { clearInterval(codeTimer); box.innerHTML = ""; }
+  };
+  clearInterval(codeTimer);
+  paint();
+  codeTimer = setInterval(paint, 1000);
+}
+
+function syncType() {
+  const f = $("#addForm"), t = f.querySelector("[name=type]").value;
+  const isCard = t === "card", noDomain = isCard || t === "totp";
+  f.querySelectorAll(".cardfield").forEach(e => e.style.display = isCard ? "" : "none");
+  f.querySelectorAll(".httpfield").forEach(e => e.style.display = noDomain ? "none" : "");
+  f.querySelector("[name=domains]").required = !noDomain;
+  const sec = f.querySelector("[name=secret]");
+  sec.required = !isCard;
+  sec.style.display = isCard ? "none" : "";
+  sec.placeholder = t === "totp" ? "base32 种子（只提交一次，不回显）" : "凭据值（只提交一次，不回显）";
+  if (isCard) { sec.value = ""; }
+}
+
 function editScope(name, curM, curP) {
   const m = prompt(`给 ${name} 允许的方法（逗号分隔，留空=不限）`, curM);
   if (m === null) return;
@@ -281,6 +330,8 @@ $("#btnFeedback").onclick = () => {
     encodeURIComponent("[bug] ") + "&body=" + encodeURIComponent(body);
   window.open(url, "_blank", "noopener");
 };
+$("#addForm").querySelector("[name=type]").addEventListener("change", syncType);
+syncType();
 $("#btnAdopt").onclick = () => post({op: "cred_adopt"});
 $("#btnAnchor").onclick = () => post({op: "audit_anchor"});
 $("#btnRevoke").onclick = () => post({op: "revoke_list"});
